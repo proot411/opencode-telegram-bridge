@@ -1,0 +1,14 @@
+# Secrets — NEVER commit
+secret.txt
+.env
+.env.*
+
+# Dependencies
+node_modules/
+
+# Build / typecheck artifacts
+*.tsbuildinfo
+
+# Editors / OS
+.DS_Store
+*.swp
