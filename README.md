@@ -14,7 +14,7 @@ chat — from your phone, while you're away from the keyboard.
 - **Full session control** — create, list, switch, rename, compact, and delete sessions; switch models and agents without touching the terminal.
 - **Images in both directions** — send a photo and the agent sees it; ask the agent for a screenshot and it pushes one back through the `send_telegram_image` tool.
 - **Keep-alive** — survives OpenCode's hardcoded 60-minute idle eviction so the bridge never silently dies on you.
-- **Token usage** — `/tokens` reports honest per-window totals via the companion `token-usage` plugin.
+- **Token usage** — `/tokens` reports honest per-window totals via the companion [`token-usage`](https://github.com/proot411/opencode-token-usage) plugin.
 - **Zero runtime dependencies** — the Telegram Bot API is called with plain `fetch`. Nothing to `npm install` to run it.
 
 ---
@@ -137,7 +137,7 @@ tracked since 2026-09-23
 hourly detail kept 30 days · lifetime totals never expire
 ```
 
-It needs the companion **token-usage** plugin at
+It needs the companion **[token-usage](https://github.com/proot411/opencode-token-usage)** plugin at
 `~/.config/opencode/plugins/token-usage`. Without it, the command degrades to a
 single explanatory message — every other bridge feature keeps working.
 
