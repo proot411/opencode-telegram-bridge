@@ -151,17 +151,197 @@ const HELP = [
   "project appear here, and /status, /allow, and /deny span them all.",
 ].join("\n")
 
+// ------------------------------------------------------------------- hub
+//
+// OpenCode's plugin supervisor is LOCATION-SCOPED: the global config's plugin
+// is loaded once per booted location, so one process can hold several Bridge
+// instances (e.g. ~/ and ~/project). Telegram, however, allows exactly ONE
+// getUpdates loop per token — a second poller is answered with 409 "terminated
+// by other getUpdates request", and both loops retry forever: that churn is
+// the classic "bot keeps restarting" symptom. The KV offset is also global, so
+// two loops steal updates from each other and a permission/question callback
+// lands on the instance that does not own the card — which answers "expired".
+//
+// The hub owns ONE poll loop per token for the whole process. Every Bridge
+// registers as a handler; each update is routed to the handler that owns it:
+// callback cards via `wantsCallback`, plain messages to the instance waiting
+// for a typed answer, else the session-bound one.
+
+interface HubHandler {
+  authorized(chatID: number): boolean
+  wantsCallback(data: string, chatID: number | undefined): boolean
+  expectsFreeText(chatID: number): boolean
+  isBound(): boolean
+  handleCallback(callback: TelegramCallbackQuery): Promise<void>
+  handleMessage(message: TelegramMessage): Promise<void>
+  announceReconnect(failures: number): void
+}
+
+interface Hub {
+  token: string
+  bot: TelegramBot
+  pollTimeoutSec: number
+  handlers: Set<HubHandler>
+  storage: Context["storage"]
+  controller: AbortController
+  offset: number
+}
+
+/** One hub per bot token per process. */
+const hubs = new Map<string, Hub>()
+
+/** Discard updates queued before the bridge ever ran, so old chats are not replayed. */
+async function readLatestUpdateID(bot: TelegramBot): Promise<number> {
+  try {
+    const updates = await bot.getUpdates(-1, 0, undefined, 1)
+    const last = updates[updates.length - 1]
+    return last ? last.update_id + 1 : 0
+  } catch (error) {
+    warn(`could not read the Telegram backlog: ${describeError(error)}`)
+    return 0
+  }
+}
+
+async function hubRegister(
+  handler: HubHandler,
+  token: string,
+  bot: TelegramBot,
+  storage: Context["storage"],
+  pollTimeoutSec: number,
+): Promise<void> {
+  const existing = hubs.get(token)
+  if (existing) {
+    existing.handlers.add(handler)
+    return
+  }
+  const hub: Hub = {
+    token,
+    bot,
+    pollTimeoutSec,
+    handlers: new Set([handler]),
+    storage,
+    controller: new AbortController(),
+    offset: 0,
+  }
+  hubs.set(token, hub)
+  try {
+    const stored = await hub.storage.get("offset")
+    hub.offset = typeof stored === "number" && stored > 0 ? stored : await readLatestUpdateID(hub.bot)
+  } catch (error) {
+    warn(`could not read the stored update offset: ${describeError(error)}`)
+  }
+  if (hub.handlers.size === 0) {
+    // Every handler unregistered while the offset was loading — don't poll.
+    hub.controller.abort()
+    if (hubs.get(token) === hub) hubs.delete(token)
+    return
+  }
+  void pollHub(hub)
+}
+
+function hubUnregister(handler: HubHandler, token: string): void {
+  const hub = hubs.get(token)
+  if (!hub) return
+  hub.handlers.delete(handler)
+  if (hub.handlers.size > 0) return
+  // Last handler out: kill the shared loop and drop the hub so a later
+  // registration starts a fresh one from the persisted offset.
+  hub.controller.abort()
+  hubs.delete(token)
+}
+
+async function pollHub(hub: Hub): Promise<void> {
+  const controller = hub.controller
+  let failures = 0
+  // Only an explicit unregister ends polling. A transient abort/timeout from
+  // the fetch layer (flaky network, socket reset) must NOT kill this loop —
+  // `isAbort()` also matches TimeoutError, so one bad blip would otherwise
+  // take the whole bridge down for good.
+  while (!controller.signal.aborted) {
+    try {
+      const updates = await hub.bot.getUpdates(hub.offset, hub.pollTimeoutSec, controller.signal)
+      if (controller.signal.aborted) return
+      // Two+ consecutive failures = a genuine outage, not a single blip.
+      if (failures >= 2) {
+        // One notice per outage: instances share the same chat, so announce
+        // through a single (any live) handler — the rate limit lives on it.
+        for (const handler of hub.handlers) {
+          handler.announceReconnect(failures)
+          break
+        }
+      }
+      failures = 0
+      for (const update of updates) {
+        hub.offset = Math.max(hub.offset, update.update_id + 1)
+        try {
+          await dispatchHubUpdate(hub, update)
+        } catch (error) {
+          warn(`update ${update.update_id} failed: ${describeError(error)}`)
+        }
+      }
+      if (updates.length > 0) await hub.storage.set("offset", hub.offset)
+    } catch (error) {
+      if (controller.signal.aborted) return
+      failures++
+      warn(`polling failed (attempt ${failures}): ${describeError(error)}`)
+      // 3s, 6s, 12s, 24s, then capped at 30s; reset on the next clean poll.
+      await delay(Math.min(30_000, 3_000 * 2 ** Math.min(failures - 1, 4)))
+    }
+  }
+}
+
+async function dispatchHubUpdate(hub: Hub, update: TelegramUpdate): Promise<void> {
+  if (update.callback_query) {
+    const callback = update.callback_query
+    const chatID = callback.message?.chat.id
+    const data = callback.data ?? ""
+    // Only the instance that owns the card can answer it — any other one
+    // would reject the tap as "expired" (its maps never saw this key).
+    for (const handler of hub.handlers) {
+      if (chatID !== undefined && handler.wantsCallback(data, chatID)) {
+        await handler.handleCallback(callback)
+        return
+      }
+    }
+    // Nobody owns the prompt any more (expired, or a reload race): answer
+    // honestly instead of dropping the tap and leaving a spinner forever.
+    if (chatID === undefined) {
+      await hub.bot.answerCallbackQuery(callback.id)
+    } else if ([...hub.handlers].some((handler) => handler.authorized(chatID))) {
+      const stale = data.startsWith("p:") || data.startsWith("q:") || data.startsWith("d:")
+      if (stale) await hub.bot.answerCallbackQuery(callback.id, "This prompt has expired.", true)
+      else await hub.bot.answerCallbackQuery(callback.id)
+    } else {
+      await hub.bot.answerCallbackQuery(callback.id, "This chat is not authorized.", true)
+    }
+    return
+  }
+  if (!update.message) return
+  const message = update.message
+  const chatID = message.chat.id
+  const handlers = [...hub.handlers]
+  if (handlers.length === 0) return
+  const allowed = handlers.filter((handler) => handler.authorized(chatID))
+  const candidates = allowed.length > 0 ? allowed : handlers
+  // Typed answers go to the instance actually waiting for one (mirrors
+  // consumeAnswerText's acceptance), else the session-bound instance, else a
+  // single representative — it owns the "not authorized" reply too.
+  const target =
+    candidates.find((handler) => handler.expectsFreeText(chatID)) ??
+    candidates.find((handler) => handler.isBound()) ??
+    candidates[0]
+  await target.handleMessage(message)
+}
+
 export class Bridge {
   private readonly ctx: Context
   private readonly options: BridgeOptions
   private readonly bot: TelegramBot
 
   private stopped = false
-  private offset = 0
   private primaryChat?: number
   private sessionID?: string
 
-  private pollController?: AbortController
   private readonly eventControllers = new Set<AbortController>()
 
   private readonly trackedCache = new Map<string, boolean>()
@@ -196,9 +376,6 @@ export class Bridge {
       this.options.sessionID ?? (typeof storedSession === "string" && storedSession !== "" ? storedSession : undefined)
     if (this.options.sessionID) await this.ctx.storage.set("session", this.options.sessionID)
 
-    const storedOffset = await this.ctx.storage.get("offset")
-    this.offset = typeof storedOffset === "number" && storedOffset > 0 ? storedOffset : await this.latestUpdateID()
-
     await this.bot
       .setMyCommands([
         { command: "help", description: "How the bridge works" },
@@ -221,8 +398,9 @@ export class Bridge {
       ])
       .catch(() => undefined)
 
-    this.pollController = new AbortController()
-    void this.pollLoop()
+    // One shared poll loop per token for the whole process — the hub. Other
+    // locations' instances (see the hub notes above) register with it too.
+    await hubRegister(this, this.options.token, this.bot, this.ctx.storage, this.options.pollTimeoutSec)
     void this.eventLoop()
     // Keep the hosting location from idling out (see keepAlivePoke). Fires once
     // almost immediately: a plugin reload restarts this timer but not the
@@ -240,10 +418,11 @@ export class Bridge {
 
   async stop(): Promise<void> {
     if (this.stopped) return
-    // Kill inbound polling FIRST. A hung flush must never leave a stale loop
-    // running beside the replacement instance — two loops fight over getUpdates
-    // and Telegram answers 409, killing both.
-    this.pollController?.abort()
+    // Leave the hub FIRST: no update may route into an instance that is
+    // tearing down, and the shared loop dies with the last handler. A stale
+    // loop beside the replacement instance would fight over getUpdates and
+    // Telegram answers 409, killing both.
+    hubUnregister(this, this.options.token)
     // Flush partial output best-effort, bounded so a dead Telegram cannot wedge
     // teardown (which would stop the next bridge from ever starting). The
     // helpers still send because `stopped` is only set after the flush.
@@ -325,18 +504,6 @@ export class Bridge {
     this.scheduleKeepAlive(delay)
   }
 
-  /** Discard updates queued before the bridge ever ran, so old chats are not replayed. */
-  private async latestUpdateID(): Promise<number> {
-    try {
-      const updates = await this.bot.getUpdates(-1, 0, undefined, 1)
-      const last = updates[updates.length - 1]
-      return last ? last.update_id + 1 : 0
-    } catch (error) {
-      warn(`could not read the Telegram backlog: ${describeError(error)}`)
-      return 0
-    }
-  }
-
   // ------------------------------------------------------------------- output
 
   private primaryChatId(): number | undefined {
@@ -348,7 +515,7 @@ export class Bridge {
     return undefined
   }
 
-  private authorized(chatID: number): boolean {
+  authorized(chatID: number): boolean {
     if (this.options.allowAllChats) return true
     return this.options.chatIDs.has(String(chatID))
   }
@@ -387,9 +554,9 @@ export class Bridge {
 
   private async eventLoop(): Promise<void> {
     let failures = 0
-    // Mirror pollLoop: only an explicit stop ends this. A transient abort must
-    // not kill the event stream, or streaming output and permission prompts die
-    // silently while polling keeps working (a half-dead bridge).
+    // Mirror the hub's poll loop: only an explicit stop ends this. A transient
+    // abort must not kill the event stream, or streaming output and permission
+    // prompts die silently while polling keeps working (a half-dead bridge).
     while (!this.stopped) {
       const controller = new AbortController()
       this.eventControllers.add(controller)
@@ -914,47 +1081,14 @@ export class Bridge {
     }
   }
 
-  // ------------------------------------------------------------------- polling
-
-  private async pollLoop(): Promise<void> {
-    let failures = 0
-    // Only an explicit stop ends polling. A transient abort/timeout from the
-    // fetch layer (flaky network, socket reset) must NOT kill this loop — that
-    // was how the bridge silently stopped reconnecting: `isAbort()` also matches
-    // TimeoutError, so one bad blip took the whole bridge down for good.
-    while (!this.stopped && !this.pollController?.signal.aborted) {
-      try {
-        const updates = await this.bot.getUpdates(this.offset, this.options.pollTimeoutSec, this.pollController?.signal)
-        if (this.stopped) return
-        // Two+ consecutive failures = a genuine outage, not a single blip.
-        // This is the ONLY announce the bridge sends now.
-        if (failures >= 2) this.announceReconnect(failures)
-        failures = 0
-        for (const update of updates) {
-          this.offset = Math.max(this.offset, update.update_id + 1)
-          try {
-            await this.handleUpdate(update)
-          } catch (error) {
-            warn(`update ${update.update_id} failed: ${describeError(error)}`)
-          }
-        }
-        if (updates.length > 0) await this.ctx.storage.set("offset", this.offset)
-      } catch (error) {
-        if (this.stopped || this.pollController?.signal.aborted) return
-        failures++
-        warn(`polling failed (attempt ${failures}): ${describeError(error)}`)
-        // 3s, 6s, 12s, 24s, then capped at 30s; reset on the next clean poll.
-        await delay(Math.min(30_000, 3_000 * 2 ** Math.min(failures - 1, 4)))
-      }
-    }
-  }
+  // ------------------------------------------------------------- reconnection
 
   /**
    * One quiet "we're back" after a real outage. Never fires on plugin reload
    * (a fresh instance starts with `failures = 0`), and rate-limited so a
    * flapping connection can't nag.
    */
-  private announceReconnect(failures: number): void {
+  announceReconnect(failures: number): void {
     if (!this.options.announce) return
     const now = Date.now()
     if (now - this.lastReconnectNotice < RECONNECT_NOTICE_MIN_MS) return
@@ -966,15 +1100,45 @@ export class Bridge {
     )
   }
 
-  private async handleUpdate(update: TelegramUpdate): Promise<void> {
-    if (update.callback_query) {
-      await this.handleCallback(update.callback_query)
-      return
+  // ------------------------------------------------------------ hub routing
+
+  /**
+   * True when THIS instance owns the card behind a callback tap. The hub only
+   * routes a tap here when this returns true — any other instance would reject
+   * it as "expired" because its maps never saw the key.
+   */
+  wantsCallback(data: string, chatID: number | undefined): boolean {
+    if (chatID === undefined || !this.authorized(chatID)) return false
+    const parts = data.split(":")
+    const key = parts[1]
+    if (parts[0] === "p") {
+      const card = key !== undefined ? this.permCards.get(key) : undefined
+      return card?.chatID === chatID
     }
-    if (update.message) await this.handleMessage(update.message)
+    if (parts[0] === "q") {
+      const wait = key !== undefined ? this.questions.get(key) : undefined
+      return wait !== undefined && !wait.settled && wait.chatID === chatID
+    }
+    if (parts[0] === "d") return key !== undefined && this.pendingDeletes.has(key)
+    return false
   }
 
-  private async handleCallback(callback: TelegramCallbackQuery): Promise<void> {
+  /** True while this instance would swallow a typed message as a question answer (mirrors consumeAnswerText). */
+  expectsFreeText(chatID: number): boolean {
+    for (const wait of this.questions.values()) {
+      if (wait.chatID !== chatID || wait.settled) continue
+      if (wait.freeText !== null) return true
+      if (wait.answers.some((answer) => answer === null)) return true
+    }
+    return false
+  }
+
+  /** True when this instance is bound to a session — the preferred target for plain messages. */
+  isBound(): boolean {
+    return this.sessionID !== undefined
+  }
+
+  async handleCallback(callback: TelegramCallbackQuery): Promise<void> {
     const chatID = callback.message?.chat.id
     const data = callback.data ?? ""
     if (chatID === undefined) {
@@ -1130,7 +1294,7 @@ export class Bridge {
 
   // ------------------------------------------------------------------- inbound
 
-  private async handleMessage(message: TelegramMessage): Promise<void> {
+  async handleMessage(message: TelegramMessage): Promise<void> {
     const chatID = message.chat.id
     if (!this.authorized(chatID)) {
       if (this.options.revealChatID) {

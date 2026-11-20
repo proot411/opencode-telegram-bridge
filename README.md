@@ -220,14 +220,20 @@ Telegram  ⇄  telegram.ts (Bot API client)  ⇄  bridge.ts (event loop & comman
   `.gitignore` for exactly this reason.
 - **The chat allowlist is the front door.** With `allowAllChats: false` (default),
   every unknown chat is told to go away and shown its own ID instead of being heard.
-- **One bot, one location.** See limitations below — a token shared across running
-  locations would let update streams collide.
+- **One bot per OpenCode process.** Instances loaded for several locations
+  share one update loop (see limitations below) — but two *separate* OpenCode
+  processes must never share a token, or their pollers will still collide.
 
 ## Limitations & notes
 
-- **One location per token.** If several OpenCode projects run simultaneously, each
-  loads its own bridge and they would compete for the same bot's update stream.
-  Use one bot per active location (or leave the bridge enabled in only one project).
+- **Several locations share one token — automatically.** OpenCode loads the
+  plugin once per booted location, so one process can run several instances
+  (e.g. `~` and `~/project`). They coordinate through a process-wide hub: a
+  single `getUpdates` loop per bot token, and every tap is routed to the
+  instance that owns the card, so concurrent locations no longer fight over
+  the update stream (Telegram answers a second poller with 409) or swallow
+  each other's callbacks. Separate *processes* are not covered: give each
+  running OpenCode instance its own bot token.
 - Telegram messages cap at 4096 characters; longer output is split automatically.
 - Question select lists are capped by Telegram's inline-keyboard practical limits —
   very long option lists get truncated labels, and "Type your own answer" is always
