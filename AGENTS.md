@@ -23,13 +23,15 @@ plugin loaded once per **location** (project directory).
 1. **Never commit or print secrets.** `secret.txt`, `.env*`, and the bot token
    inside `~/.config/opencode/opencode.jsonc` must never appear in commits,
    diffs, logs, or tool output. The user's Telegram chat ID is also private.
-2. **Typecheck gate — identical error set, not zero errors.** `npm run
-   typecheck` reports **18 pre-existing errors** (missing `@types/node`,
-   token-usage `.ts` imports, and three cast/shape errors). Your change is only
-   acceptable if the *sorted multiset* of error lines is byte-identical to
-   baseline. Verify:
+2. **Typecheck gate — identical error set, not zero errors.** Direct `tsc`
+   reports **18 pre-existing errors** (missing `@types/node`, token-usage
+   `.ts` imports, and three cast/shape errors). Your change is only acceptable
+   if the *sorted multiset* of error lines is byte-identical to baseline.
+   Verify (invoke tsc directly — `npm run` injects banner lines and breaks the
+   hash):
    ```sh
-   npm run typecheck 2>&1 | LC_ALL=C sort | sed 's/([0-9]*,[0-9]*)//' | LC_ALL=C sort | md5sum
+   ./node_modules/.bin/tsc -p tsconfig.json --noEmit 2>&1 \
+     | LC_ALL=C sort | sed 's/([0-9]*,[0-9]*)//' | LC_ALL=C sort | md5sum
    # must print 1cdd7381f7d43df03a14e19aa465b357
    ```
    Practical consequences: importing `node:*` needs `// @ts-ignore` on a
