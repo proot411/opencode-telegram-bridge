@@ -18,6 +18,12 @@ chat — from your phone, while you're away from the keyboard.
 - **Token usage** — `/tokens` reports honest per-window totals via the companion [`token-usage`](https://github.com/proot411/opencode-token-usage) plugin.
 - **Zero runtime dependencies** — the Telegram Bot API is called with plain `fetch`. Nothing to `npm install` to run it.
 
+## Documentation
+
+- [AGENTS.md](AGENTS.md) — ground rules and invariants for AI agents working in this repo
+- [ARCHITECTURE.md](ARCHITECTURE.md) — how the pieces fit: hub + lease, form mirroring, reload safety
+- [docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md) — the KV breadcrumb reference for post-mortems
+
 ---
 
 ## 1. Create a bot
@@ -278,6 +284,8 @@ src/
 ├── media.ts     # image loading and screen capture
 ├── events.ts    # event/question types and model-content helpers
 └── options.ts   # option parsing with defensive defaults
+test/
+└── harness.mjs  # behavioral harness (84 checks) — run with npm run test:harness
 ```
 
 Typecheck (requires Node/npm, not bundled with OpenCode):
@@ -285,7 +293,12 @@ Typecheck (requires Node/npm, not bundled with OpenCode):
 ```sh
 npm install
 npm run typecheck
+npm run test:harness
 ```
+
+Agents working in this repo: read [AGENTS.md](AGENTS.md) first — it documents
+the hard invariants (typecheck gate, one-poller lease, stateless form taps)
+that keep the bridge alive.
 
 The package has no Telegram dependencies — the Bot API is called with plain
 `fetch`. `@opencode/plugin`, `effect`, and `@opencode/client` (used to settle
