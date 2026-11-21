@@ -1,6 +1,7 @@
 import type { Context } from "@opencode/plugin/promise/plugin"
 import type { BridgeOptions } from "./options.js"
 import type { BridgeEvent, PermissionRequestData, QuestionPrompt } from "./events.js"
+import type { FormClient } from "./service.js"
 import { describeFailure } from "./events.js"
 import {
   MAX_IMAGE_BYTES,
@@ -83,6 +84,22 @@ interface QuestionWait {
   resolve: (answers: string[][]) => void
   reject: (error: Error) => void
   timer?: ReturnType<typeof setTimeout>
+  /**
+   * Set when this wait mirrors an OpenCode Form instead of a local tool call.
+   * The form is the single source of truth: the TUI's poll and this wait both
+   * settle it (HTTP reply vs. the TUI's own submit), first answer wins. There
+   * is no local promise — `resolve`/`reject` stay unused for these waits.
+   */
+  form?: FormMirror
+  /** True while a form reply is in flight; blocks re-entry, allows a retry. */
+  delivering?: boolean
+}
+
+/** The form fields this wait can answer, aligned index-for-index with `questions`. */
+interface FormMirror {
+  id: string
+  sessionID: string
+  fields: Array<{ key: string; type: "string" | "multiselect" }>
 }
 
 interface StreamState {
@@ -150,6 +167,70 @@ const HELP = [
   "With all-session permissions on, prompts from every session in this",
   "project appear here, and /status, /allow, and /deny span them all.",
 ].join("\n")
+
+// ---------------------------------------------------------------- question forms
+
+/** The form fields a question-tool form consists of (what the bridge can answer). */
+interface MirroredForm {
+  questions: QuestionPrompt[]
+  fields: Array<{ key: string; type: "string" | "multiselect" }>
+}
+
+/**
+ * Convert an OpenCode Form's fields into the question shape the bridge already
+ * renders, keeping only the types the Telegram keyboard can answer honestly
+ * (the built-in question tool only ever creates these two). Unknown field
+ * kinds — number/boolean/external forms from MCP or other plugins — are
+ * skipped; a form with none left is not mirrored and falls back to a notice.
+ */
+function formFieldsToQuestions(fields: unknown): MirroredForm {
+  const questions: QuestionPrompt[] = []
+  const mirrored: MirroredForm["fields"] = []
+  for (const raw of Array.isArray(fields) ? fields : []) {
+    const field = raw as {
+      key?: unknown
+      title?: unknown
+      description?: unknown
+      type?: unknown
+      options?: unknown
+    }
+    if (typeof field.key !== "string" || field.key === "") continue
+    if (field.type !== "string" && field.type !== "multiselect") continue
+    const header = typeof field.title === "string" && field.title.trim() !== "" ? field.title.trim() : undefined
+    const text = typeof field.description === "string" && field.description.trim() !== "" ? field.description.trim() : undefined
+    const options = Array.isArray(field.options)
+      ? field.options
+          .map((option) => option as { label?: unknown; description?: unknown })
+          .filter((option) => typeof option.label === "string" && option.label.trim() !== "")
+          .map((option) => ({
+            label: (option.label as string).trim(),
+            description:
+              typeof option.description === "string" && option.description.trim() !== ""
+                ? option.description.trim()
+                : undefined,
+          }))
+      : []
+    questions.push({
+      question: text ?? header ?? field.key,
+      header,
+      options,
+      multiple: field.type === "multiselect",
+    })
+    mirrored.push({ key: field.key, type: field.type })
+  }
+  return { questions, fields: mirrored }
+}
+
+/** The HTTP client surfaces Effect errors as messages/_tags; match loosely. */
+function isFormSettledError(error: unknown): boolean {
+  const text = describeError(error)
+  return text.includes("Form.AlreadySettledError") || /already settled/i.test(text)
+}
+
+function isFormNotFoundError(error: unknown): boolean {
+  const text = describeError(error)
+  return text.includes("Form.NotFoundError") || /form not found/i.test(text)
+}
 
 // ------------------------------------------------------------------- hub
 //
@@ -348,6 +429,10 @@ export class Bridge {
   private readonly permCards = new Map<string, PermissionCard>()
   private readonly unsentPermissions = new Map<string, PermissionRequestData>()
   private readonly questions = new Map<string, QuestionWait>()
+  /** Question waits keyed by the OpenCode Form they mirror (event → wait). */
+  private readonly formWaits = new Map<string, QuestionWait>()
+  /** HTTP connection back into this server; undefined ⇒ Telegram-only fallback. */
+  private readonly formClient?: FormClient
   private readonly streams = new Map<string, StreamState>()
   private readonly callNames = new Map<string, string>()
   /** Last `/models` result, so `/model <n>` maps to what was on screen. */
@@ -359,10 +444,11 @@ export class Bridge {
   /** Pending keep-alive poke (see keepAlivePoke). */
   private keepAliveTimer?: ReturnType<typeof setTimeout>
 
-  constructor(ctx: Context, options: BridgeOptions, bot: TelegramBot) {
+  constructor(ctx: Context, options: BridgeOptions, bot: TelegramBot, formClient?: FormClient) {
     this.ctx = ctx
     this.options = options
     this.bot = bot
+    this.formClient = formClient
   }
 
   // ---------------------------------------------------------------- lifecycle
@@ -414,6 +500,10 @@ export class Bridge {
     // re-ran start(), spamming "connected" every time. The only announce worth
     // sending is a real reconnect after an outage — see announceReconnect().
     await this.replayPendingPermissions()
+    // Re-attach to question forms already pending when this instance loaded
+    // (plugin reload mid-question): the TUI poll never went away, only our
+    // mirror did. Best-effort; the event stream covers everything after this.
+    if (this.formClient) void this.sweepPendingForms()
   }
 
   async stop(): Promise<void> {
@@ -423,6 +513,21 @@ export class Bridge {
     // loop beside the replacement instance would fight over getUpdates and
     // Telegram answers 409, killing both.
     hubUnregister(this, this.options.token)
+    // Close question cards BEFORE the stopped flag is set — safeEdit refuses
+    // to send afterwards, and the cards must say why their buttons died.
+    for (const wait of [...this.questions.values()]) {
+      if (wait.form) {
+        // Detach only: the underlying form stays pending so the TUI poll keeps
+        // working across a reload. Cards lose their buttons (honest taps), and
+        // the replacement instance re-presents them via sweepPendingForms().
+        if (wait.timer !== undefined) clearTimeout(wait.timer)
+        this.questions.delete(wait.key)
+        this.formWaits.delete(wait.form.id)
+        void this.noteUnanswered(wait, "🔄 OpenCode reloaded — a fresh prompt is on its way.")
+        continue
+      }
+      this.settleQuestion(wait, "cancelled")
+    }
     // Flush partial output best-effort, bounded so a dead Telegram cannot wedge
     // teardown (which would stop the next bridge from ever starting). The
     // helpers still send because `stopped` is only set after the flush.
@@ -437,7 +542,6 @@ export class Bridge {
     this.keepAliveTimer = undefined
     for (const controller of this.eventControllers) controller.abort()
     this.eventControllers.clear()
-    for (const wait of [...this.questions.values()]) this.settleQuestion(wait, "cancelled")
   }
 
   /** Schedule the next keep-alive poke (see keepAlivePoke). */
@@ -589,6 +693,15 @@ export class Bridge {
     if (location && location.directory !== this.ctx.location.directory) return
     const data = event.data ?? {}
 
+    // console never reaches OpenCode's log, so form activity is recorded in
+    // the KV store — the only durable channel for post-mortem diagnosis.
+    if (event.type.startsWith("form.")) {
+      const id = typeof data.id === "string" ? data.id : (data.form?.id as string | undefined)
+      void this.ctx.storage
+        .set("lastFormEvent", `${new Date().toISOString()} | ${event.type} | ${id ?? "?"}`)
+        .catch(() => undefined)
+    }
+
     switch (event.type) {
       case "permission.asked": {
         const request = data as unknown as PermissionRequestData
@@ -605,16 +718,45 @@ export class Bridge {
         return
       }
       case "form.created": {
-        // Safety net: a form this plugin could not take over (another plugin's
-        // form, or a failed question-tool override) still has to be visible.
         const form = data.form
         if (!form?.sessionID || !(await this.tracked(form.sessionID))) return
         const chatID = this.primaryChatId()
         if (chatID === undefined) return
+        // Question-tool forms are mirrored button-for-button: the TUI shows
+        // the native poll, Telegram shows these cards, both settle the SAME
+        // form and the first answer wins.
+        if (this.formClient && form.metadata?.kind === "question") {
+          const mirrored = formFieldsToQuestions(form.fields)
+          if (mirrored.questions.length > 0) {
+            await this.presentForm(chatID, form, mirrored)
+            return
+          }
+        }
+        // Anything this bridge cannot honestly answer (no service connection,
+        // another plugin's form, unsupported field kinds) still has to be
+        // visible rather than silently swallowed.
         await this.safeSendTo(
           chatID,
           `❓ ${form.title ?? "A question was created"}\n\nAnswer it in the OpenCode interface — the Telegram bridge could not take this one over.`,
         )
+        return
+      }
+      case "form.replied": {
+        // Settled elsewhere — the TUI poll was answered (or our own reply
+        // landed first; then the wait is already gone and this is a no-op).
+        const wait = typeof data.id === "string" ? this.formWaits.get(data.id) : undefined
+        if (!wait || wait.settled) return
+        this.applyFormAnswers(wait, data.answer)
+        for (let index = 0; index < wait.questions.length; index++) await this.redrawQuestion(wait, index)
+        this.settleQuestion(wait, "answered")
+        return
+      }
+      case "form.cancelled": {
+        // Dismissed or interrupted upstream: close the cards honestly so a
+        // later tap reports "expired" against a card that already says why.
+        const wait = typeof data.id === "string" ? this.formWaits.get(data.id) : undefined
+        if (!wait || wait.settled) return
+        this.settleQuestion(wait, "cancelled")
         return
       }
       case "session.execution.started": {
@@ -951,7 +1093,12 @@ export class Bridge {
     wait.answers[index] = values
     wait.freeText = null
     await this.redrawQuestion(wait, index)
-    if (wait.answers.every((answer) => answer !== null)) this.settleQuestion(wait, "answered")
+    if (wait.answers.every((answer) => answer !== null)) {
+      // A mirror delivers to the OpenCode Form (the TUI poll closes when the
+      // server accepts it); a local wait resolves its tool call directly.
+      if (wait.form) void this.deliverFormAnswer(wait)
+      else this.settleQuestion(wait, "answered")
+    }
   }
 
   /** Synchronous settle; follow-up notices are fired and not awaited on purpose. */
@@ -960,6 +1107,17 @@ export class Bridge {
     wait.settled = true
     if (wait.timer !== undefined) clearTimeout(wait.timer)
     this.questions.delete(wait.key)
+
+    if (wait.form) {
+      // A mirror never owns the form's lifetime — the caller already replied,
+      // cancelled, or saw the form's own terminal event. Only the cards need
+      // closing here ("answered" cards were already redrawn button-less by
+      // setQuestionAnswer / applyFormAnswers).
+      this.formWaits.delete(wait.form.id)
+      if (outcome === "timeout") void this.noteUnanswered(wait, "⏱ No answer (timed out).")
+      else if (outcome === "cancelled") void this.noteUnanswered(wait, "⏹ Dismissed.")
+      return
+    }
 
     if (outcome === "cancelled") {
       void this.noteUnanswered(wait, "⏹ Cancelled.")
@@ -976,6 +1134,204 @@ export class Bridge {
       const messageID = wait.messageIDs[index]
       if (messageID === undefined) continue
       await this.safeEdit(wait.chatID, messageID, `${this.renderQuestion(wait, index)}\n\n${note}`)
+    }
+  }
+
+  // ------------------------------------------------------------ question forms
+
+  /**
+   * Present a pending OpenCode Form in Telegram as a mirror of the TUI's
+   * native poll. The wait carries the form id: answers (taps or typed text)
+   * are collected by the shared keyboard flow, then delivered over HTTP —
+   * the TUI poll and these cards settle the SAME form, first answer wins.
+   */
+  private async presentForm(
+    chatID: number,
+    form: { id?: unknown; sessionID?: unknown },
+    mirrored: MirroredForm,
+  ): Promise<void> {
+    const formID = typeof form.id === "string" ? form.id : undefined
+    const sessionID = typeof form.sessionID === "string" ? form.sessionID : undefined
+    if (!formID || !sessionID || this.formWaits.has(formID)) return
+
+    const key = this.newQuestionKey()
+    const wait: QuestionWait = {
+      key,
+      sessionID,
+      chatID,
+      questions: mirrored.questions,
+      messageIDs: mirrored.questions.map(() => undefined),
+      answers: mirrored.questions.map(() => null),
+      selected: mirrored.questions.map(() => new Set<number>()),
+      freeText: null,
+      settled: false,
+      // Unused for form waits: the OpenCode Form carries the promise.
+      resolve: () => undefined,
+      reject: () => undefined,
+      form: { id: formID, sessionID, fields: mirrored.fields },
+    }
+    wait.timer = setTimeout(() => void this.onFormTimeout(wait), this.options.questionTimeoutMs)
+    this.questions.set(key, wait)
+    this.formWaits.set(formID, wait)
+
+    for (let index = 0; index < mirrored.questions.length; index++) {
+      const message = await this.safeSendTo(
+        chatID,
+        this.renderQuestion(wait, index),
+        this.renderQuestionKeyboard(wait, index),
+      )
+      if (wait.settled) return
+      if (!message) {
+        // Telegram may be down; the wait stays alive (typed answers still
+        // work) and the timeout eventually cancels the form honestly.
+        warn(`could not present question form ${formID} in Telegram`)
+        continue
+      }
+      wait.messageIDs[index] = message.message_id
+    }
+  }
+
+  /**
+   * The question timeout expired without a Telegram answer. Cancel the form
+   * with model-facing feedback — mirrors the built-in non-interactive path:
+   * the model continues instead of the step ending — then close the cards.
+   */
+  private async onFormTimeout(wait: QuestionWait): Promise<void> {
+    const form = wait.form
+    if (!form || wait.settled) return
+    this.settleQuestion(wait, "timeout")
+    try {
+      await this.formClient?.session.form.cancel({
+        sessionID: form.sessionID,
+        formID: form.id,
+        message: "No answer (timed out).",
+      })
+    } catch (error) {
+      // Without this cancel the form (and the tool) would wait forever; the
+      // TUI can still answer by hand, which settles the form and the tool.
+      warn(`could not cancel form ${form.id} after timeout: ${describeError(error)}`)
+    }
+  }
+
+  /** All questions answered on a mirrored form: deliver the record to OpenCode. */
+  private async deliverFormAnswer(wait: QuestionWait): Promise<void> {
+    const form = wait.form
+    const client = this.formClient
+    if (!form || !client || wait.settled || wait.delivering) return
+    wait.delivering = true
+    void this.ctx.storage
+      .set("lastFormDelivery", `${new Date().toISOString()} | replying ${form.id}`)
+      .catch(() => undefined)
+    try {
+      await client.session.form.reply({ sessionID: form.sessionID, formID: form.id, answer: this.buildFormAnswer(wait) })
+      wait.delivering = false
+      this.settleQuestion(wait, "answered")
+      void this.ctx.storage
+        .set("lastFormDelivery", `${new Date().toISOString()} | delivered ${form.id}`)
+        .catch(() => undefined)
+      return
+    } catch (error) {
+      wait.delivering = false
+      const detail = describeError(error)
+      if (isFormSettledError(error)) {
+        // The TUI answered in the same instant. Show the answer that actually
+        // settled the form, not the one we raced with.
+        try {
+          const settled = await client.session.form.get({ sessionID: form.sessionID, formID: form.id })
+          if (settled.state.status !== "answered") {
+            this.settleQuestion(wait, "cancelled")
+            return
+          }
+          this.applyFormAnswers(wait, settled.state.answer)
+          for (let index = 0; index < wait.questions.length; index++) await this.redrawQuestion(wait, index)
+        } catch {
+          // Cards keep the answers we tried to deliver; close enough.
+        }
+        this.settleQuestion(wait, "answered")
+        return
+      }
+      if (isFormNotFoundError(error)) {
+        this.settleQuestion(wait, "cancelled")
+        return
+      }
+      warn(`could not deliver form answer ${form.id}: ${detail}`)
+      void this.ctx.storage
+        .set("lastFormDelivery", `${new Date().toISOString()} | failed ${form.id}: ${detail}`)
+        .catch(() => undefined)
+      // A one-off blip must not lose the answer: show the failure, leave a
+      // Retry button, and let the timeout cancel the form if nobody retries.
+      await this.noteFormFailure(wait, `⚠️ Could not deliver the answer to OpenCode: ${detail}`)
+    }
+  }
+
+  /** Append a failure note; the first card gets a Retry button back. */
+  private async noteFormFailure(wait: QuestionWait, note: string): Promise<void> {
+    const retry: InlineKeyboard = {
+      inline_keyboard: [[{ text: "🔄 Retry delivery", callback_data: `q:${wait.key}:0:r` }]],
+    }
+    for (let index = 0; index < wait.messageIDs.length; index++) {
+      const messageID = wait.messageIDs[index]
+      if (messageID === undefined) continue
+      await this.safeEdit(
+        wait.chatID,
+        messageID,
+        `${this.renderQuestion(wait, index)}\n\n${note}`,
+        index === 0 ? retry : undefined,
+      )
+    }
+  }
+
+  /** Fill the wait's answers from a form answer record (best effort). */
+  private applyFormAnswers(wait: QuestionWait, answer: unknown): void {
+    const record = (answer ?? {}) as Record<string, unknown>
+    wait.form?.fields.forEach((field, index) => {
+      const value = record[field.key]
+      if (value === undefined || value === null) return
+      const values = Array.isArray(value) ? value.map((item) => String(item)) : [String(value)]
+      if (values.length > 0) wait.answers[index] = values
+    })
+    // Whatever the form's final state left unanswered renders as "Unanswered"
+    // without buttons — the display the built-in tool produces.
+    wait.answers = wait.answers.map((entry) => entry ?? [])
+  }
+
+  /** The form answer record for the collected per-question answers. */
+  private buildFormAnswer(wait: QuestionWait): Record<string, string | string[]> {
+    const answer: Record<string, string | string[]> = {}
+    wait.form?.fields.forEach((field, index) => {
+      const values = wait.answers[index]
+      if (!values || values.length === 0) return
+      // `string` fields take a scalar, `multiselect` the array; the built-in
+      // tool reads `q${index}` and joins, so option labels are the values.
+      answer[field.key] = field.type === "multiselect" ? values : values[0]
+    })
+    return answer
+  }
+
+  /**
+   * Re-attach to question forms already pending when this instance loaded
+   * (a plugin reload mid-question): present them again so Telegram mirrors
+   * the TUI's live poll.
+   */
+  private async sweepPendingForms(): Promise<void> {
+    const client = this.formClient
+    if (!client) return
+    try {
+      const chatID = this.primaryChatId()
+      if (chatID === undefined) return
+      for await (const session of this.listSessions({ directory: String(this.ctx.location.directory) })) {
+        if (!(await this.tracked(session.id))) continue
+        const forms = await client.session.form.list({ sessionID: session.id })
+        for (const form of forms) {
+          if (this.formWaits.has(form.id)) continue
+          if (form.metadata?.kind !== "question") continue
+          const mirrored = formFieldsToQuestions(form.fields)
+          if (mirrored.questions.length === 0) continue
+          await this.presentForm(chatID, form, mirrored)
+        }
+      }
+    } catch (error) {
+      warn(`could not sweep pending question forms: ${describeError(error)}`)
     }
   }
 
@@ -1239,7 +1595,22 @@ export class Bridge {
     }
 
     const question = wait.questions[index]
+
+    if (action === "r") {
+      // A failed delivery re-opened this card with a Retry button.
+      await this.bot.answerCallbackQuery(callback.id)
+      if (wait.form) void this.deliverFormAnswer(wait)
+      return
+    }
+
     if (wait.answers[index] !== null) {
+      if (wait.form && !wait.delivering && wait.answers.every((answer) => answer !== null)) {
+        // Every answer was collected but delivery failed: tapping anything
+        // retries instead of reporting a dead end.
+        await this.bot.answerCallbackQuery(callback.id)
+        void this.deliverFormAnswer(wait)
+        return
+      }
       await this.bot.answerCallbackQuery(callback.id, "Already answered.")
       return
     }

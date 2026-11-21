@@ -3,6 +3,7 @@ import { Bridge } from "./bridge.js";
 import { readOptions } from "./options.js";
 import { TelegramBot } from "./telegram.js";
 import { normalizeQuestions, toModelContent } from "./events.js";
+import { connectService } from "./service.js";
 
 /**
  * opencode-telegram-bridge
@@ -37,50 +38,67 @@ const plugin = Plugin.define({
       return;
     }
 
+    // The server's own service registration (same-process url + pid + password)
+    // is what lets this plugin call back into OpenCode over HTTP. With that
+    // connection the built-in `question` tool runs UNTOUCHED: it creates an
+    // OpenCode Form, the TUI renders the interactive poll, and the bridge
+    // mirrors the same form to Telegram — first answer wins on either side.
+    const formClient = await connectService();
+
     const bot = new TelegramBot(options.token, options.apiBase);
-    const bridge = new Bridge(ctx, options, bot);
+    const bridge = new Bridge(ctx, options, bot, formClient);
     await bridge.start();
+    // Durable diagnostic: which question flow this reload settled on (KV is
+    // the only channel that survives — console output never reaches the log).
+    await ctx.storage.set("questionMode", formClient ? "form" : "hijack").catch(() => undefined);
 
-    // Route the built-in `question` tool to Telegram, bypassing OpenCode's form
-    // UI. Built-in "pre" plugins (including the question tool) register before
-    // config plugins, so the tool is present when this transform first runs;
-    // the callback also re-resolves the id on every later registry rebuild.
-    let patched = false;
-    const registration = await ctx.tool.transform((editor) => {
-      const question = editor.list().find((tool) => isQuestionTool(tool.id, tool.description));
-      if (!question) return;
-      patched = true;
-      editor.update(question.id, (tool) => {
-        tool.execute = async (input, context) => {
-          const questions = normalizeQuestions(input);
+    // Fallback (service registration unavailable): route the built-in
+    // `question` tool to Telegram, bypassing OpenCode's form UI — the
+    // pre-connection behavior, kept so a broken registration never loses the
+    // ability to answer from Telegram. Built-in "pre" plugins (including the
+    // question tool) register before config plugins, so the tool is present
+    // when this transform first runs; the callback also re-resolves the id on
+    // every later registry rebuild.
+    let disposeRegistration: (() => Promise<void>) | undefined;
+    if (!formClient) {
+      let patched = false;
+      const registration = await ctx.tool.transform((editor) => {
+        const question = editor.list().find((tool) => isQuestionTool(tool.id, tool.description));
+        if (!question) return;
+        patched = true;
+        editor.update(question.id, (tool) => {
+          tool.execute = async (input, context) => {
+            const questions = normalizeQuestions(input);
 
-          // Same permission gate as the built-in tool: deny rules and
-          // permission.asked prompts (surfaced to Telegram by this plugin)
-          // apply before any question is shown. Errors propagate as tool
-          // failures, exactly like the built-in implementation.
-          await ctx.permission.assert({
-            sessionID: context.sessionID,
-            agent: context.agent,
-            action: "question",
-            resources: ["*"],
-            source: { type: "tool", messageID: context.messageID, id: context.id },
-          });
+            // Same permission gate as the built-in tool: deny rules and
+            // permission.asked prompts (surfaced to Telegram by this plugin)
+            // apply before any question is shown. Errors propagate as tool
+            // failures, exactly like the built-in implementation.
+            await ctx.permission.assert({
+              sessionID: context.sessionID,
+              agent: context.agent,
+              action: "question",
+              resources: ["*"],
+              source: { type: "tool", messageID: context.messageID, id: context.id },
+            });
 
-          const answers = await bridge.askQuestions(context.sessionID, questions, context.signal);
-          return {
-            output: { answers },
-            content: toModelContent(questions, answers),
-            metadata: { answers },
+            const answers = await bridge.askQuestions(context.sessionID, questions, context.signal);
+            return {
+              output: { answers },
+              content: toModelContent(questions, answers),
+              metadata: { answers },
+            };
           };
-        };
+        });
       });
-    });
+      disposeRegistration = () => registration.dispose();
 
-    if (!patched) {
-      console.warn(
-        "[opencode-telegram-bridge] built-in question tool not found during setup — " +
-          "questions fall back to OpenCode forms (a Telegram notice is still sent).",
-      );
+      if (!patched) {
+        console.warn(
+          "[opencode-telegram-bridge] built-in question tool not found during setup — " +
+            "questions fall back to OpenCode forms (a Telegram notice is still sent).",
+        );
+      }
     }
 
     // Let the agent push pictures to Telegram (screenshots, charts, renders)
@@ -150,7 +168,7 @@ const plugin = Plugin.define({
     }
 
     return async () => {
-      await registration.dispose().catch(() => undefined);
+      await disposeRegistration?.().catch(() => undefined);
       await imageTool?.dispose().catch(() => undefined);
       await bridge.stop();
     };

@@ -11,6 +11,9 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@opencode/client": "2.0.32"
+  },
   "devDependencies": {
     "@opencode/plugin": "2.0.32"
   }

@@ -9,7 +9,7 @@ answer questions, swap models, exchange photos, and watch answers stream into yo
 chat — from your phone, while you're away from the keyboard.
 
 - **Permission cards** — pending permissions arrive as a card with inline buttons: *Allow once* / *Allow always* / *Reject*.
-- **Questions as buttons** — the built-in `question` tool is replaced so the agent asks you directly in Telegram: tappable single/multi-select options or free text, no form UI.
+- **Questions as buttons, in both UIs** — the agent's `question` prompts appear as an interactive poll in the OpenCode TUI **and** as tappable cards in Telegram at the same time. Both answer the same poll; first answer wins.
 - **Live streaming** — the agent's answer streams into one Telegram message that edits itself in place.
 - **Full session control** — create, list, switch, rename, compact, and delete sessions; switch models and agents without touching the terminal.
 - **Images in both directions** — send a photo and the agent sees it; ask the agent for a screenshot and it pushes one back through the `send_telegram_image` tool.
@@ -160,7 +160,7 @@ All options live under the plugin's `options` object in `opencode.json(c)`.
 | `toolNotifications` | `false` | Notify on every tool call (🔧 / ✅ / ❌) |
 | `forwardAllSessions` | `false` | Mirror **every** session in this location, not just the bridged one |
 | `allSessionPermissions` | `false` | Surface and manage permission requests from **every** session in this location; `/status`, `/allow`, `/deny` span them all |
-| `questionTimeoutMs` | `600000` | How long an agent question waits before resolving as "Unanswered" (5000–3600000) |
+| `questionTimeoutMs` | `600000` | How long an agent question waits before the poll is cancelled with "No answer (timed out)" feedback (5000–3600000) |
 | `pollTimeoutSec` | `50` | Telegram long-poll window (10–50 s) |
 | `keepAlive` | `true` | Periodically poke OpenCode so its 60-minute idle sweep can't evict the location (see below) |
 | `imageSend` | `true` | Expose the `send_telegram_image` tool to the agent |
@@ -191,12 +191,19 @@ Disable it only if something else in that location already keeps it busy.
   card; a tap calls `permission.reply({ decision })`. Pending requests that existed
   before the plugin started are replayed on startup. Replies from other clients
   close the card too (`permission.replied`).
-- **Questions** — the built-in `question` tool (`ctx.tool.transform` → `editor.update`)
-  is replaced with an implementation that keeps the same permission gate
-  (`permission.assert` on action `question`) and then asks in Telegram, returning
-  the same `output`/`content`/`metadata` shape the model expects. `form.created`
-  remains as a safety net: if the override ever misses, you get a heads-up
-  notification instead of silence.
+- **Questions** — the built-in `question` tool runs untouched: it creates an
+  OpenCode Form, which is what the TUI renders as the interactive poll. The
+  bridge mirrors that same form to Telegram (`form.created` → cards with the
+  same buttons), and a tap or typed answer settles the form over HTTP
+  (`session.form.reply` via the server's own service registration). The TUI
+  poll and the Telegram cards are two answer channels for one poll — the first
+  answer wins on either side, and `form.replied` / `form.cancelled` events
+  keep the cards honest when the TUI answers first or the run is interrupted.
+  If the service registration is unavailable (or a form is one the bridge
+  cannot honestly answer — other plugins' forms, unsupported field kinds), the
+  cards degrade to a notice pointing at the TUI, and when even the built-in
+  tool cannot create a form the bridge falls back to replacing its `execute`
+  with a Telegram-only flow.
 - **Streaming** — `session.text.started/delta/ended` events drive one Telegram
   message that is edited in place (throttled by `streamIntervalMs`), falling back
   to a fresh message per chunk when streaming is off or the message grew too large.
@@ -235,6 +242,11 @@ Telegram  ⇄  telegram.ts (Bot API client)  ⇄  bridge.ts (event loop & comman
   each other's callbacks. Separate *processes* are not covered: give each
   running OpenCode instance its own bot token.
 - Telegram messages cap at 4096 characters; longer output is split automatically.
+- The TUI-poll mirror needs the server's service registration
+  (`~/.local/state/opencode/service.json`, written by the running server) and
+  only answers forms of the server process it runs in. Without it, questions
+  fall back to Telegram-only cards — the TUI shows the tool's status line but
+  no interactive poll.
 - Question select lists are capped by Telegram's inline-keyboard practical limits —
   very long option lists get truncated labels, and "Type your own answer" is always
   available as a fallback.
@@ -250,6 +262,7 @@ index.ts         # entrypoint shim (OpenCode probes <dir>/index.* for local plug
 src/
 ├── index.ts     # Plugin.define entry: options → bot → bridge → question-tool override
 ├── bridge.ts    # event loop, permission cards, question flow, streaming, commands
+├── service.ts   # service-registration discovery + the session.form.* client
 ├── telegram.ts  # minimal Bot API client (fetch + write queue + backoff)
 ├── media.ts     # image loading and screen capture
 ├── events.ts    # event/question types and model-content helpers
@@ -263,9 +276,10 @@ npm install
 npm run typecheck
 ```
 
-The package has no runtime dependencies — `@opencode/plugin` and `effect` are
-always provided by the OpenCode host at runtime, and the Telegram API is called
-with plain `fetch`.
+The package has no Telegram dependencies — the Bot API is called with plain
+`fetch`. `@opencode/plugin`, `effect`, and `@opencode/client` (used to settle
+question forms over HTTP) are provided by the OpenCode host at runtime; they
+are declared only so editors and `tsc` can typecheck against them.
 
 ## License
 
