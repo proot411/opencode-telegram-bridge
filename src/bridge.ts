@@ -296,6 +296,24 @@ interface Hub {
   lastPollBeat: number
 }
 
+/**
+ * Fingerprint of THIS module instantiation. OpenCode loads the plugin module
+ * once per location — if two locations show different UIDs, module state
+ * (the `hubs` map!) is NOT shared and the "process-wide hub" premise is wrong.
+ */
+const MODULE_UID = Math.random().toString(36).slice(2, 8)
+
+// ---------------------------------------------------------------- poll lease
+//
+// The plugin module (and its module-level state!) is instantiated ONCE PER
+// LOCATION — two locations run two `hubs` maps, two poll loops, and Telegram
+// answers the second poller with 409 forever. So the long-poll is leased
+// through the SHARED plugin KV instead: one owner polls, everyone else
+// stands by and takes over if the owner's lease goes stale.
+
+const POLL_LEASE_KEY = "pollLease"
+const POLL_LEASE_TTL_MS = 90_000
+
 /** Append to a bounded KV log at module scope (hub events). */
 async function appendHubLog(storage: Context["storage"], key: string, text: string): Promise<void> {
   const previous = await storage.get(key).catch(() => undefined)
@@ -329,7 +347,7 @@ async function hubRegister(
   const existing = hubs.get(token)
   if (existing) {
     existing.handlers.add(handler)
-    await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} → joined hub (${existing.handlers.size} handlers)`)
+    await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} [${MODULE_UID}] → joined hub (${existing.handlers.size} handlers)`)
     return
   }
   const hub: Hub = {
@@ -343,7 +361,7 @@ async function hubRegister(
     lastPollBeat: Date.now(),
   }
   hubs.set(token, hub)
-  await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} → created hub`)
+  await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} [${MODULE_UID}] → created hub`)
   try {
     const stored = await hub.storage.get("offset")
     hub.offset = typeof stored === "number" && stored > 0 ? stored : await readLatestUpdateID(hub.bot)
@@ -399,8 +417,32 @@ function debugIDOf(handler: HubHandler): string {
   return handler instanceof Bridge ? handler.debugID() : "unknown-handler"
 }
 
+/** The lease owner id for this module instance (one per location). */
+function leaseOwner(): string {
+  return MODULE_UID
+}
+
+/** Read the shared poll lease; undefined when free/absent/corrupt. */
+async function readPollLease(hub: Hub): Promise<{ owner: string; at: number } | undefined> {
+  const raw = await hub.storage.get(POLL_LEASE_KEY).catch(() => undefined)
+  if (typeof raw !== "string" || raw === "") return undefined
+  try {
+    const lease = JSON.parse(raw) as { owner?: unknown; at?: unknown }
+    if (typeof lease.owner !== "string" || typeof lease.at !== "number") return undefined
+    return { owner: lease.owner, at: lease.at }
+  } catch {
+    return undefined
+  }
+}
+
+/** Best-effort lease write; races resolve on the next cycle. */
+async function writePollLease(hub: Hub, owner: string): Promise<void> {
+  await hub.storage.set(POLL_LEASE_KEY, JSON.stringify({ owner, at: Date.now() })).catch(() => undefined)
+}
+
 async function pollHub(hub: Hub): Promise<void> {
   const controller = hub.controller
+  const me = leaseOwner()
   let failures = 0
   // Only an explicit unregister ends polling. A transient abort/timeout from
   // the fetch layer (flaky network, socket reset) must NOT kill this loop —
@@ -408,6 +450,20 @@ async function pollHub(hub: Hub): Promise<void> {
   // take the whole bridge down for good.
   while (!controller.signal.aborted) {
     hub.lastPollBeat = Date.now()
+    // Cross-location lease: module state is per location, so two locations
+    // would otherwise fight over getUpdates with invisible 409s. The owner
+    // refreshes the lease every cycle; standbys poll the lease instead of
+    // Telegram and take over if the owner's lease goes stale.
+    const lease = await readPollLease(hub)
+    if (lease !== undefined && lease.owner !== me && Date.now() - lease.at < POLL_LEASE_TTL_MS) {
+      // Standby: another instance owns the long-poll. The watchdog stays
+      // quiet because we keep beating, and form taps still route here via
+      // the shared KV records.
+      hub.lastPollBeat = Date.now()
+      await delay(10_000)
+      continue
+    }
+    await writePollLease(hub, me)
     try {
       const updates = await hub.bot.getUpdates(hub.offset, hub.pollTimeoutSec, controller.signal)
       if (controller.signal.aborted) return
@@ -430,6 +486,7 @@ async function pollHub(hub: Hub): Promise<void> {
         }
       }
       if (updates.length > 0) await hub.storage.set("offset", hub.offset)
+      await writePollLease(hub, me)
     } catch (error) {
       if (controller.signal.aborted) return
       failures++
@@ -1770,7 +1827,7 @@ export class Bridge {
       if (wait.freeText !== null) return true
       if (wait.answers.some((answer) => answer === null)) return true
     }
-    return false
+    return this.expectsFreeTextFromRecords(chatID)
   }
 
   /** True when an adopted form record for this chat is still collecting. */
