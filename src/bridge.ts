@@ -93,6 +93,11 @@ interface QuestionWait {
   form?: FormMirror
   /** True while a form reply is in flight; blocks re-entry, allows a retry. */
   delivering?: boolean
+  /**
+   * Write-through hook for form waits: after each mutation the wait state is
+   * persisted, so a tap adopted by ANY instance acts on the same state.
+   */
+  persist?: () => Promise<void>
 }
 
 /** The form fields this wait can answer, aligned index-for-index with `questions`. */
@@ -100,6 +105,27 @@ interface FormMirror {
   id: string
   sessionID: string
   fields: Array<{ key: string; type: "string" | "multiselect" }>
+}
+
+/**
+ * Durable mirror of a presented form. Taps encode the FORM ID (not a volatile
+ * wait key), so any Bridge instance in this process — after a reload, or in
+ * another location — can claim and answer them. The presenting instance keeps
+ * an in-memory wait as a render cache; this record is the source of truth.
+ */
+interface FormTapRecord {
+  sessionID: string
+  chatID: number
+  questions: QuestionPrompt[]
+  fields: Array<{ key: string; type: "string" | "multiselect" }>
+  messageIDs: Array<number | undefined>
+  /** `null` = not answered yet; empty array = explicitly unanswered. */
+  answers: Array<string[] | null>
+  selected: Array<number[]>
+  /** Question index waiting for a typed answer, if any. */
+  freeText: number | null
+  settled: boolean
+  createdAt: number
 }
 
 interface StreamState {
@@ -250,8 +276,8 @@ function isFormNotFoundError(error: unknown): boolean {
 
 interface HubHandler {
   authorized(chatID: number): boolean
-  wantsCallback(data: string, chatID: number | undefined): boolean
-  expectsFreeText(chatID: number): boolean
+  wantsCallback(data: string, chatID: number | undefined): Promise<boolean>
+  expectsFreeText(chatID: number): Promise<boolean>
   isBound(): boolean
   handleCallback(callback: TelegramCallbackQuery): Promise<void>
   handleMessage(message: TelegramMessage): Promise<void>
@@ -266,6 +292,14 @@ interface Hub {
   storage: Context["storage"]
   controller: AbortController
   offset: number
+}
+
+/** Append to a bounded KV log at module scope (hub events). */
+async function appendHubLog(storage: Context["storage"], key: string, text: string): Promise<void> {
+  const previous = await storage.get(key).catch(() => undefined)
+  const lines = typeof previous === "string" && previous !== "" ? previous.split("\n") : []
+  lines.push(`${new Date().toISOString()} | ${text}`)
+  await storage.set(key, lines.slice(-14).join("\n")).catch(() => undefined)
 }
 
 /** One hub per bot token per process. */
@@ -293,6 +327,7 @@ async function hubRegister(
   const existing = hubs.get(token)
   if (existing) {
     existing.handlers.add(handler)
+    await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} → joined hub (${existing.handlers.size} handlers)`)
     return
   }
   const hub: Hub = {
@@ -305,6 +340,7 @@ async function hubRegister(
     offset: 0,
   }
   hubs.set(token, hub)
+  await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} → created hub`)
   try {
     const stored = await hub.storage.get("offset")
     hub.offset = typeof stored === "number" && stored > 0 ? stored : await readLatestUpdateID(hub.bot)
@@ -320,15 +356,26 @@ async function hubRegister(
   void pollHub(hub)
 }
 
-function hubUnregister(handler: HubHandler, token: string): void {
+async function hubUnregister(handler: HubHandler, token: string): Promise<void> {
   const hub = hubs.get(token)
-  if (!hub) return
+  if (!hub) {
+    ;(handler as Bridge).noteHubEvent(`unregister ${debugIDOf(handler)} → no hub (already destroyed?)`)
+    return
+  }
   hub.handlers.delete(handler)
-  if (hub.handlers.size > 0) return
+  if (hub.handlers.size > 0) {
+    await appendHubLog(hub.storage, "lastHub", `unregister ${debugIDOf(handler)} → ${hub.handlers.size} left`)
+    return
+  }
   // Last handler out: kill the shared loop and drop the hub so a later
   // registration starts a fresh one from the persisted offset.
+  await appendHubLog(hub.storage, "lastHub", `unregister ${debugIDOf(handler)} → hub destroyed`)
   hub.controller.abort()
   hubs.delete(token)
+}
+
+function debugIDOf(handler: HubHandler): string {
+  return handler instanceof Bridge ? handler.debugID() : "unknown-handler"
 }
 
 async function pollHub(hub: Hub): Promise<void> {
@@ -371,6 +418,14 @@ async function pollHub(hub: Hub): Promise<void> {
   }
 }
 
+/** First handler that would swallow a typed message as a question answer. */
+async function pickHandler(candidates: HubHandler[], chatID: number): Promise<HubHandler | undefined> {
+  for (const handler of candidates) {
+    if (await handler.expectsFreeText(chatID)) return handler
+  }
+  return undefined
+}
+
 async function dispatchHubUpdate(hub: Hub, update: TelegramUpdate): Promise<void> {
   if (update.callback_query) {
     const callback = update.callback_query
@@ -379,7 +434,10 @@ async function dispatchHubUpdate(hub: Hub, update: TelegramUpdate): Promise<void
     // Only the instance that owns the card can answer it — any other one
     // would reject the tap as "expired" (its maps never saw this key).
     for (const handler of hub.handlers) {
-      if (chatID !== undefined && handler.wantsCallback(data, chatID)) {
+      if (chatID !== undefined && (await handler.wantsCallback(data, chatID))) {
+        void hub.storage
+          .set("lastCallback", `${new Date().toISOString()} | data=${data} | chat=${chatID} | claimed`)
+          .catch(() => undefined)
         await handler.handleCallback(callback)
         return
       }
@@ -390,8 +448,21 @@ async function dispatchHubUpdate(hub: Hub, update: TelegramUpdate): Promise<void
       await hub.bot.answerCallbackQuery(callback.id)
     } else if ([...hub.handlers].some((handler) => handler.authorized(chatID))) {
       const stale = data.startsWith("p:") || data.startsWith("q:") || data.startsWith("d:")
-      if (stale) await hub.bot.answerCallbackQuery(callback.id, "This prompt has expired.", true)
-      else await hub.bot.answerCallbackQuery(callback.id)
+      if (stale) {
+        // Durable post-mortem: which instances were asked, and what each one
+        // was waiting on — console output never reaches the log.
+        const states: Record<string, unknown> = {}
+        for (const handler of hub.handlers) {
+          states[(handler as Bridge).debugID()] = (handler as Bridge).debugState()
+        }
+        void hub.storage
+          .set(
+            "lastStaleCallback",
+            `${new Date().toISOString()} | data=${data} | chat=${chatID} | handlers=${JSON.stringify(states)}`,
+          )
+          .catch(() => undefined)
+        await hub.bot.answerCallbackQuery(callback.id, "This prompt has expired.", true)
+      } else await hub.bot.answerCallbackQuery(callback.id)
     } else {
       await hub.bot.answerCallbackQuery(callback.id, "This chat is not authorized.", true)
     }
@@ -408,7 +479,7 @@ async function dispatchHubUpdate(hub: Hub, update: TelegramUpdate): Promise<void
   // consumeAnswerText's acceptance), else the session-bound instance, else a
   // single representative — it owns the "not authorized" reply too.
   const target =
-    candidates.find((handler) => handler.expectsFreeText(chatID)) ??
+    (await pickHandler(candidates, chatID)) ??
     candidates.find((handler) => handler.isBound()) ??
     candidates[0]
   await target.handleMessage(message)
@@ -451,9 +522,44 @@ export class Bridge {
     this.formClient = formClient
   }
 
+  /** Stable label for hub diagnostics (KV post-mortems). */
+  debugID(): string {
+    return `${this.ctx.location.directory ?? "?"}#${this.sessionID ?? "unbound"}`
+  }
+
+  /** Durable lifecycle breadcrumb for hub post-mortems (per location, append log). */
+  noteHubEvent(text: string): void {
+    const directory = String(this.ctx.location.directory ?? "?").replace(/\//g, "_")
+    void this.appendDiagnostic(`lastLifecycle${directory}`, text).catch(() => undefined)
+  }
+
+  /** Append to a bounded KV log — last-writer-wins keys hide sequences. */
+  private async appendDiagnostic(key: string, text: string): Promise<void> {
+    const previous = await this.ctx.storage.get(key).catch(() => undefined)
+    const lines = typeof previous === "string" && previous !== "" ? previous.split("\n") : []
+    lines.push(`${new Date().toISOString()} | ${text}`)
+    await this.ctx.storage.set(key, lines.slice(-14).join("\n")).catch(() => undefined)
+  }
+
+  /** What this instance is currently waiting on — hub stale-path forensics. */
+  debugState(): Record<string, unknown> {
+    return {
+      chat: this.primaryChatId(),
+      questions: [...this.questions.values()].map((wait) => ({
+        key: wait.key,
+        chat: wait.chatID,
+        settled: wait.settled,
+        form: wait.form?.id,
+        session: wait.sessionID,
+      })),
+      forms: [...this.formWaits.keys()],
+    }
+  }
+
   // ---------------------------------------------------------------- lifecycle
 
   async start(): Promise<void> {
+    this.noteHubEvent(`start begin (${this.debugID()})`)
     const storedChat = await this.ctx.storage.get("chat")
     if (typeof storedChat === "number") this.primaryChat = storedChat
 
@@ -474,7 +580,9 @@ export class Bridge {
       }
     }
 
-    await this.bot
+    // Fire-and-forget: a Telegram hiccup here must not delay hub registration
+    // (an unregistered instance answers no taps).
+    void this.bot
       .setMyCommands([
         { command: "help", description: "How the bridge works" },
         { command: "new", description: "Start a fresh agent session" },
@@ -516,15 +624,17 @@ export class Bridge {
     // (plugin reload mid-question): the TUI poll never went away, only our
     // mirror did. Best-effort; the event stream covers everything after this.
     if (this.formClient) void this.sweepPendingForms()
+    this.noteHubEvent(`start end (${this.debugID()})`)
   }
 
   async stop(): Promise<void> {
     if (this.stopped) return
+    this.noteHubEvent(`stop begin (${this.debugID()})`)
     // Leave the hub FIRST: no update may route into an instance that is
     // tearing down, and the shared loop dies with the last handler. A stale
     // loop beside the replacement instance would fight over getUpdates and
     // Telegram answers 409, killing both.
-    hubUnregister(this, this.options.token)
+    await hubUnregister(this, this.options.token)
     // Close question cards BEFORE the stopped flag is set — safeEdit refuses
     // to send afterwards, and the cards must say why their buttons died.
     for (const wait of [...this.questions.values()]) {
@@ -554,6 +664,7 @@ export class Bridge {
     this.keepAliveTimer = undefined
     for (const controller of this.eventControllers) controller.abort()
     this.eventControllers.clear()
+    this.noteHubEvent(`stop end (${this.debugID()})`)
   }
 
   /** Schedule the next keep-alive poke (see keepAlivePoke). */
@@ -766,7 +877,9 @@ export class Bridge {
       case "form.replied": {
         // Settled elsewhere — the TUI poll was answered (or our own reply
         // landed first; then the wait is already gone and this is a no-op).
-        const wait = typeof data.id === "string" ? this.formWaits.get(data.id) : undefined
+        const formID = typeof data.id === "string" ? data.id : undefined
+        if (!formID) return
+        const wait = this.formWaits.get(formID) ?? (await this.adoptFormWait(formID))
         if (!wait || wait.settled) return
         this.applyFormAnswers(wait, data.answer)
         for (let index = 0; index < wait.questions.length; index++) await this.redrawQuestion(wait, index)
@@ -776,7 +889,9 @@ export class Bridge {
       case "form.cancelled": {
         // Dismissed or interrupted upstream: close the cards honestly so a
         // later tap reports "expired" against a card that already says why.
-        const wait = typeof data.id === "string" ? this.formWaits.get(data.id) : undefined
+        const formID = typeof data.id === "string" ? data.id : undefined
+        if (!formID) return
+        const wait = this.formWaits.get(formID) ?? (await this.adoptFormWait(formID))
         if (!wait || wait.settled) return
         this.settleQuestion(wait, "cancelled")
         return
@@ -1095,6 +1210,9 @@ export class Bridge {
   private renderQuestionKeyboard(wait: QuestionWait, index: number): InlineKeyboard | undefined {
     const question = wait.questions[index]
     if (wait.answers[index] !== null) return undefined // answered: drop the buttons
+    // Form taps carry the FORM ID, not the volatile wait key: any instance in
+    // this process can claim them after a reload (stateless routing).
+    const prefix = wait.form ? `f:${wait.form.id}` : `q:${wait.key}`
     const keyboard: InlineButton[][] = []
     const options = question.options ?? []
     if (question.multiple) {
@@ -1103,20 +1221,20 @@ export class Bridge {
         keyboard.push([
           {
             text: `${selected.has(optionIndex) ? "✅ " : ""}${fitMessage(option.label, 60)}`,
-            callback_data: `q:${wait.key}:${index}:${optionIndex}`,
+            callback_data: `${prefix}:${index}:${optionIndex}`,
           },
         ])
       })
       keyboard.push([
-        { text: "🧹 Clear", callback_data: `q:${wait.key}:${index}:c` },
-        { text: "👍 Done", callback_data: `q:${wait.key}:${index}:d` },
+        { text: "🧹 Clear", callback_data: `${prefix}:${index}:c` },
+        { text: "👍 Done", callback_data: `${prefix}:${index}:d` },
       ])
     } else {
       options.forEach((option, optionIndex) => {
-        keyboard.push([{ text: fitMessage(option.label, 64), callback_data: `q:${wait.key}:${index}:${optionIndex}` }])
+        keyboard.push([{ text: fitMessage(option.label, 64), callback_data: `${prefix}:${index}:${optionIndex}` }])
       })
     }
-    keyboard.push([{ text: "✏️ Type your own answer", callback_data: `q:${wait.key}:${index}:f` }])
+    keyboard.push([{ text: "✏️ Type your own answer", callback_data: `${prefix}:${index}:f` }])
     return { inline_keyboard: keyboard }
   }
 
@@ -1135,6 +1253,7 @@ export class Bridge {
     if (wait.settled || wait.answers[index] !== null) return
     wait.answers[index] = values
     wait.freeText = null
+    await wait.persist?.()
     await this.redrawQuestion(wait, index)
     if (wait.answers.every((answer) => answer !== null)) {
       // A mirror delivers to the OpenCode Form (the TUI poll closes when the
@@ -1155,8 +1274,10 @@ export class Bridge {
       // A mirror never owns the form's lifetime — the caller already replied,
       // cancelled, or saw the form's own terminal event. Only the cards need
       // closing here ("answered" cards were already redrawn button-less by
-      // setQuestionAnswer / applyFormAnswers).
+      // setQuestionAnswer / applyFormAnswers). The durable record goes too:
+      // later taps must answer "expired" honestly.
       this.formWaits.delete(wait.form.id)
+      void wait.persist?.()
       if (outcome === "timeout") void this.noteUnanswered(wait, "⏱ No answer (timed out).")
       else if (outcome === "cancelled") void this.noteUnanswered(wait, "⏹ Dismissed.")
       return
@@ -1213,9 +1334,12 @@ export class Bridge {
       reject: () => undefined,
       form: { id: formID, sessionID, fields: mirrored.fields },
     }
+    wait.persist = () => this.saveFormTap(formID, wait)
     wait.timer = setTimeout(() => void this.onFormTimeout(wait), this.options.questionTimeoutMs)
     this.questions.set(key, wait)
     this.formWaits.set(formID, wait)
+    await this.saveFormTap(formID, wait)
+    void this.appendDiagnostic("lastFormPresent", `form=${formID} | key=${key} | chat=${chatID} | session=${sessionID}`)
 
     for (let index = 0; index < mirrored.questions.length; index++) {
       const message = await this.safeSendTo(
@@ -1231,7 +1355,94 @@ export class Bridge {
         continue
       }
       wait.messageIDs[index] = message.message_id
+      await wait.persist()
     }
+  }
+
+  // ------------------------------------------------- form tap records (KV)
+
+  /** The durable mirror of a presented form — the source of truth for taps. */
+  private formTapKey(formID: string): string {
+    return `formTap:${formID}`
+  }
+
+  private async saveFormTap(formID: string, wait: QuestionWait): Promise<void> {
+    const record: FormTapRecord = {
+      sessionID: wait.form?.sessionID ?? wait.sessionID,
+      chatID: wait.chatID,
+      questions: wait.questions,
+      fields: wait.form?.fields ?? [],
+      messageIDs: wait.messageIDs,
+      answers: wait.answers,
+      selected: wait.selected.map((set) => [...set]),
+      freeText: wait.freeText,
+      settled: wait.settled,
+      createdAt: Date.now(),
+    }
+    if (wait.settled) {
+      // Settled taps answer "expired" honestly; no need to keep the record.
+      await this.ctx.storage.set(this.formTapKey(formID), "").catch(() => undefined)
+      await this.removeFromFormIndex(formID)
+      return
+    }
+    await this.ctx.storage.set(this.formTapKey(formID), JSON.stringify(record)).catch(() => undefined)
+    await this.addToFormIndex(formID)
+  }
+
+  /** Live form IDs, so record-based free-text/tap routing can enumerate them. */
+  private async addToFormIndex(formID: string): Promise<void> {
+    const raw = await this.ctx.storage.get("formTapIndex").catch(() => undefined)
+    const ids = typeof raw === "string" && raw !== "" ? raw.split(",").filter((id) => id !== formID) : []
+    ids.push(formID)
+    await this.ctx.storage.set("formTapIndex", ids.slice(-20).join(",")).catch(() => undefined)
+  }
+
+  private async removeFromFormIndex(formID: string): Promise<void> {
+    const raw = await this.ctx.storage.get("formTapIndex").catch(() => undefined)
+    if (typeof raw !== "string" || raw === "") return
+    const ids = raw.split(",").filter((id) => id !== formID && id !== "")
+    await this.ctx.storage.set("formTapIndex", ids.join(",")).catch(() => undefined)
+  }
+
+  private async loadFormTap(formID: string): Promise<FormTapRecord | undefined> {
+    const raw = await this.ctx.storage.get(this.formTapKey(formID)).catch(() => undefined)
+    if (typeof raw !== "string" || raw === "") return undefined
+    try {
+      const record = JSON.parse(raw) as FormTapRecord
+      if (!Array.isArray(record.questions) || !Array.isArray(record.answers)) return undefined
+      return record
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Rebuild a renderable wait from the durable record (adoption path). */
+  private waitFromRecord(formID: string, record: FormTapRecord): QuestionWait {
+    const wait: QuestionWait = {
+      key: formID,
+      sessionID: record.sessionID,
+      chatID: record.chatID,
+      questions: record.questions,
+      messageIDs: [...record.messageIDs],
+      answers: [...record.answers],
+      selected: record.selected.map((list) => new Set(list)),
+      freeText: record.freeText,
+      settled: record.settled,
+      resolve: () => undefined,
+      reject: () => undefined,
+      form: { id: formID, sessionID: record.sessionID, fields: record.fields },
+      persist: () => this.saveFormTap(formID, wait),
+    }
+    return wait
+  }
+
+  /** Register a record-backed wait locally so event handlers can close it. */
+  private async adoptFormWait(formID: string): Promise<QuestionWait | undefined> {
+    const record = await this.loadFormTap(formID)
+    if (!record || record.settled) return undefined
+    const wait = this.waitFromRecord(formID, record)
+    this.formWaits.set(formID, wait)
+    return wait
   }
 
   /**
@@ -1310,7 +1521,7 @@ export class Bridge {
   /** Append a failure note; the first card gets a Retry button back. */
   private async noteFormFailure(wait: QuestionWait, note: string): Promise<void> {
     const retry: InlineKeyboard = {
-      inline_keyboard: [[{ text: "🔄 Retry delivery", callback_data: `q:${wait.key}:0:r` }]],
+      inline_keyboard: [[{ text: "🔄 Retry delivery", callback_data: `${wait.form ? "f" : "q"}:${wait.form ? wait.form.id : wait.key}:0:r` }]],
     }
     for (let index = 0; index < wait.messageIDs.length; index++) {
       const messageID = wait.messageIDs[index]
@@ -1502,11 +1713,11 @@ export class Bridge {
   // ------------------------------------------------------------ hub routing
 
   /**
-   * True when THIS instance owns the card behind a callback tap. The hub only
-   * routes a tap here when this returns true — any other instance would reject
-   * it as "expired" because its maps never saw the key.
+   * True when THIS instance can act on the callback tap. Local waits answer
+   * from volatile maps; form taps (`f:`) consult the durable record, so ANY
+   * instance — fresh, reloaded, or in another location — can claim them.
    */
-  wantsCallback(data: string, chatID: number | undefined): boolean {
+  async wantsCallback(data: string, chatID: number | undefined): Promise<boolean> {
     if (chatID === undefined || !this.authorized(chatID)) return false
     const parts = data.split(":")
     const key = parts[1]
@@ -1518,16 +1729,37 @@ export class Bridge {
       const wait = key !== undefined ? this.questions.get(key) : undefined
       return wait !== undefined && !wait.settled && wait.chatID === chatID
     }
+    if (parts[0] === "f") {
+      if (key === undefined) return false
+      const record = await this.loadFormTap(key)
+      return record !== undefined && !record.settled && record.chatID === chatID
+    }
     if (parts[0] === "d") return key !== undefined && this.pendingDeletes.has(key)
     return false
   }
 
-  /** True while this instance would swallow a typed message as a question answer (mirrors consumeAnswerText). */
-  expectsFreeText(chatID: number): boolean {
+  /**
+   * True while this instance would swallow a typed message as a question
+   * answer (mirrors consumeAnswerText, including adopted form records).
+   */
+  async expectsFreeText(chatID: number): Promise<boolean> {
     for (const wait of this.questions.values()) {
       if (wait.chatID !== chatID || wait.settled) continue
       if (wait.freeText !== null) return true
       if (wait.answers.some((answer) => answer === null)) return true
+    }
+    return false
+  }
+
+  /** True when an adopted form record for this chat is still collecting. */
+  private async expectsFreeTextFromRecords(chatID: number): Promise<boolean> {
+    const raw = await this.ctx.storage.get("formTapIndex").catch(() => undefined)
+    if (typeof raw !== "string" || raw === "") return false
+    for (const formID of raw.split(",")) {
+      const record = await this.loadFormTap(formID)
+      if (!record || record.settled || record.chatID !== chatID) continue
+      if (record.freeText !== null) return true
+      if (record.answers.some((answer) => answer === null)) return true
     }
     return false
   }
@@ -1554,6 +1786,12 @@ export class Bridge {
     }
     if (data.startsWith("q:")) {
       await this.handleQuestionCallback(callback, chatID)
+      return
+    }
+    if (data.startsWith("f:")) {
+      const formID = data.split(":")[1]
+      if (formID) await this.handleFormTap(callback, chatID, formID)
+      else await this.bot.answerCallbackQuery(callback.id, "This question has expired.", true)
       return
     }
     if (data.startsWith("d:")) {
@@ -1626,6 +1864,7 @@ export class Bridge {
     await this.safeEdit(chatID, messageID, `🗑 Deleted ${pending.title}.`)
   }
 
+  /** Tap on a legacy/local question card (wait key in the callback data). */
   private async handleQuestionCallback(callback: TelegramCallbackQuery, chatID: number): Promise<void> {
     const parts = (callback.data ?? "").split(":")
     const key = parts[1]
@@ -1636,7 +1875,44 @@ export class Bridge {
       await this.bot.answerCallbackQuery(callback.id, "This question has expired.", true)
       return
     }
+    await this.applyTapAction(callback, wait, index, action)
+  }
 
+  /**
+   * Tap on a form card. The callback carries the FORM ID, so this works from
+   * ANY instance — the presenting one, or a fresh adopter after a reload.
+   * State comes from the durable KV record, not from volatile maps.
+   */
+  private async handleFormTap(callback: TelegramCallbackQuery, chatID: number, formID: string): Promise<void> {
+    const parts = (callback.data ?? "").split(":")
+    const index = Number(parts[2])
+    const action = parts[3]
+    const record = await this.loadFormTap(formID)
+    if (!record || record.settled || record.chatID !== chatID || !Number.isInteger(index) || index < 0 || index >= record.questions.length) {
+      await this.bot.answerCallbackQuery(callback.id, "This question has expired.", true)
+      return
+    }
+    const wait = this.waitFromRecord(formID, record)
+    // Adopt the form so form.replied / form.cancelled events edit the cards
+    // from this instance too (whichever gets the event first wins). If the
+    // PRESENTING instance is still here, prefer its live wait — the record
+    // mirrors it and its random key must stay the one settled.
+    const live = this.formWaits.get(formID)
+    if (live && !live.settled) {
+      await this.applyTapAction(callback, live, index, action)
+      return
+    }
+    this.formWaits.set(formID, wait)
+    await this.applyTapAction(callback, wait, index, action)
+  }
+
+  /** Shared decision tree for question taps, local or adopted. */
+  private async applyTapAction(
+    callback: TelegramCallbackQuery,
+    wait: QuestionWait,
+    index: number,
+    action: string,
+  ): Promise<void> {
     const question = wait.questions[index]
 
     if (action === "r") {
@@ -1661,6 +1937,7 @@ export class Bridge {
     if (action === "f") {
       wait.freeText = index
       await this.bot.answerCallbackQuery(callback.id)
+      await wait.persist?.()
       await this.redrawQuestion(wait, index, "✏️ Send your answer as a message.")
       return
     }
@@ -1669,6 +1946,7 @@ export class Bridge {
       wait.selected[index]?.clear()
       wait.freeText = null
       await this.bot.answerCallbackQuery(callback.id)
+      await wait.persist?.()
       await this.redrawQuestion(wait, index)
       return
     }
@@ -1698,6 +1976,7 @@ export class Bridge {
       if (selected?.has(optionIndex)) selected.delete(optionIndex)
       else selected?.add(optionIndex)
       await this.bot.answerCallbackQuery(callback.id)
+      await wait.persist?.()
       await this.redrawQuestion(wait, index)
       return
     }
@@ -1848,6 +2127,21 @@ export class Bridge {
       if (index < 0 || index >= wait.questions.length) continue
       await this.setQuestionAnswer(wait, index, [text])
       return true
+    }
+    // Adopted forms: a fresh instance holds no in-memory wait, but the
+    // durable record still collects the answer.
+    const raw = await this.ctx.storage.get("formTapIndex").catch(() => undefined)
+    if (typeof raw === "string" && raw !== "") {
+      for (const formID of raw.split(",")) {
+        const record = await this.loadFormTap(formID)
+        if (!record || record.settled || record.chatID !== chatID) continue
+        const wait = this.waitFromRecord(formID, record)
+        this.formWaits.set(formID, wait)
+        const index = wait.freeText ?? wait.answers.findIndex((answer) => answer === null)
+        if (index < 0 || index >= wait.questions.length) continue
+        await this.setQuestionAnswer(wait, index, [text])
+        return true
+      }
     }
     return false
   }

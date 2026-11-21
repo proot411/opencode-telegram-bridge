@@ -28,6 +28,18 @@ import { connectService } from "./service.js";
 const plugin = Plugin.define({
   id: "opencode-telegram-bridge",
   async setup(ctx) {
+    // Lifecycle breadcrumbs: the supervisor reloads this plugin constantly,
+    // and console output never reaches the log — KV is the only record of
+    // setup/cleanup ordering per location.
+    const dir = String(ctx.location.directory ?? "?").replace(/\//g, "_");
+    const breadcrumb = async (text: string) => {
+      const previous = await ctx.storage.get(`lastSetup${dir}`).catch(() => undefined);
+      const lines = typeof previous === "string" && previous !== "" ? previous.split("\n") : [];
+      lines.push(`${new Date().toISOString()} | ${text}`);
+      await ctx.storage.set(`lastSetup${dir}`, lines.slice(-14).join("\n")).catch(() => undefined);
+    };
+    void breadcrumb("setup begin");
+    breadcrumb("setup begin");
     const options = readOptions(ctx.options);
 
     if (!options.token) {
@@ -167,7 +179,9 @@ const plugin = Plugin.define({
       await ctx.storage.set("imageTool", "disabled");
     }
 
+    await breadcrumb("setup end");
     return async () => {
+      await breadcrumb("cleanup called");
       await disposeRegistration?.().catch(() => undefined);
       await imageTool?.dispose().catch(() => undefined);
       await bridge.stop();
