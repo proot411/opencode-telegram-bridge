@@ -292,6 +292,8 @@ interface Hub {
   storage: Context["storage"]
   controller: AbortController
   offset: number
+  /** Last time the poll loop came around (success or failure). */
+  lastPollBeat: number
 }
 
 /** Append to a bounded KV log at module scope (hub events). */
@@ -338,6 +340,7 @@ async function hubRegister(
     storage,
     controller: new AbortController(),
     offset: 0,
+    lastPollBeat: Date.now(),
   }
   hubs.set(token, hub)
   await appendHubLog(storage, "lastHub", `register ${debugIDOf(handler)} → created hub`)
@@ -349,11 +352,29 @@ async function hubRegister(
   }
   if (hub.handlers.size === 0) {
     // Every handler unregistered while the offset was loading — don't poll.
+    await appendHubLog(hub.storage, "lastHub", `hub ${token.slice(-6)} emptied while offset loaded — destroyed`)
     hub.controller.abort()
     if (hubs.get(token) === hub) hubs.delete(token)
     return
   }
   void pollHub(hub)
+  void hubWatchdog(hub)
+}
+
+/**
+ * Restart the poll loop if it ever dies without the hub being aborted — a
+ * reload race can leave a fresh hub with no loop, and then taps never arrive
+ * while cards still go out (the worst failure mode: visible but deaf).
+ */
+async function hubWatchdog(hub: Hub): Promise<void> {
+  while (!hub.controller.signal.aborted) {
+    await delay(60_000)
+    if (hub.controller.signal.aborted) return
+    if (Date.now() - hub.lastPollBeat < 180_000) continue
+    await appendHubLog(hub.storage, "lastHub", `poll loop silent ${Math.round((Date.now() - hub.lastPollBeat) / 1000)}s — restarting`)
+    hub.lastPollBeat = Date.now()
+    void pollHub(hub)
+  }
 }
 
 async function hubUnregister(handler: HubHandler, token: string): Promise<void> {
@@ -386,6 +407,7 @@ async function pollHub(hub: Hub): Promise<void> {
   // `isAbort()` also matches TimeoutError, so one bad blip would otherwise
   // take the whole bridge down for good.
   while (!controller.signal.aborted) {
+    hub.lastPollBeat = Date.now()
     try {
       const updates = await hub.bot.getUpdates(hub.offset, hub.pollTimeoutSec, controller.signal)
       if (controller.signal.aborted) return
