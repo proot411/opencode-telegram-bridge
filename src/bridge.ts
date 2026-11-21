@@ -461,6 +461,18 @@ export class Bridge {
     this.sessionID =
       this.options.sessionID ?? (typeof storedSession === "string" && storedSession !== "" ? storedSession : undefined)
     if (this.options.sessionID) await this.ctx.storage.set("session", this.options.sessionID)
+    if (this.sessionID && !this.options.sessionID) {
+      // A stored binding can outlive its session (deleted from elsewhere):
+      // keep it and every question mirror dies with it. Unbind so the next
+      // Telegram message creates a fresh session instead of erroring forever.
+      try {
+        await this.ctx.session.get({ sessionID: this.sessionID })
+      } catch {
+        warn(`stored session ${this.sessionID} no longer exists — unbinding`)
+        this.sessionID = undefined
+        await this.ctx.storage.set("session", "").catch(() => undefined)
+      }
+    }
 
     await this.bot
       .setMyCommands([
@@ -697,8 +709,12 @@ export class Bridge {
     // the KV store — the only durable channel for post-mortem diagnosis.
     if (event.type.startsWith("form.")) {
       const id = typeof data.id === "string" ? data.id : (data.form?.id as string | undefined)
+      const sid = typeof data.sessionID === "string" ? data.sessionID : (data.form?.sessionID as string | undefined)
       void this.ctx.storage
-        .set("lastFormEvent", `${new Date().toISOString()} | ${event.type} | ${id ?? "?"}`)
+        .set(
+          "lastFormEvent",
+          `${new Date().toISOString()} | ${event.type} | ${id ?? "?"} | session=${sid ?? "?"} | env=${event.location?.directory ?? "none"}`,
+        )
         .catch(() => undefined)
     }
 
@@ -719,13 +735,17 @@ export class Bridge {
       }
       case "form.created": {
         const form = data.form
-        if (!form?.sessionID || !(await this.tracked(form.sessionID))) return
+        if (!form?.sessionID || typeof form.sessionID !== "string") return
         const chatID = this.primaryChatId()
         if (chatID === undefined) return
-        // Question-tool forms are mirrored button-for-button: the TUI shows
-        // the native poll, Telegram shows these cards, both settle the SAME
-        // form and the first answer wins.
+        // Question-tool forms are mirrored button-for-button across every
+        // session in this location — the user may ask from any TUI session
+        // and still answer from Telegram (the same semantics
+        // allSessionPermissions gives permissions). The TUI shows the native
+        // poll, Telegram shows these cards, both settle the SAME form and
+        // the first answer wins.
         if (this.formClient && form.metadata?.kind === "question") {
+          if (!(await this.sessionIsLocal(form.sessionID))) return
           const mirrored = formFieldsToQuestions(form.fields)
           if (mirrored.questions.length > 0) {
             await this.presentForm(chatID, form, mirrored)
@@ -734,7 +754,9 @@ export class Bridge {
         }
         // Anything this bridge cannot honestly answer (no service connection,
         // another plugin's form, unsupported field kinds) still has to be
-        // visible rather than silently swallowed.
+        // visible rather than silently swallowed — but only for sessions this
+        // bridge is attached to, so foreign locations stay quiet.
+        if (!(await this.tracked(form.sessionID))) return
         await this.safeSendTo(
           chatID,
           `❓ ${form.title ?? "A question was created"}\n\nAnswer it in the OpenCode interface — the Telegram bridge could not take this one over.`,
@@ -868,6 +890,27 @@ export class Bridge {
   private async trackedPermission(sessionID: unknown): Promise<boolean> {
     if (this.options.allSessionPermissions) return true
     return this.tracked(sessionID)
+  }
+
+  /**
+   * True when the session belongs to this location (or is the bound one) —
+   * the mirror gate for question forms. One cheap `session.get` per form:
+   * questions are rare, and a fresh session's very first question must not
+   * race a cache.
+   */
+  private async sessionIsLocal(sessionID: unknown): Promise<boolean> {
+    if (typeof sessionID !== "string" || sessionID === "") return false
+    if (this.sessionID === sessionID) return true
+    try {
+      const info = (await this.ctx.session.get({ sessionID })) as unknown as {
+        location?: { directory?: string }
+      }
+      const directory = info?.location?.directory
+      if (typeof directory !== "string") return true // schema without location: don't drop the poll
+      return directory === String(this.ctx.location.directory)
+    } catch {
+      return false
+    }
   }
 
   // --------------------------------------------------------------- permissions

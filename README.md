@@ -194,16 +194,18 @@ Disable it only if something else in that location already keeps it busy.
 - **Questions** — the built-in `question` tool runs untouched: it creates an
   OpenCode Form, which is what the TUI renders as the interactive poll. The
   bridge mirrors that same form to Telegram (`form.created` → cards with the
-  same buttons), and a tap or typed answer settles the form over HTTP
-  (`session.form.reply` via the server's own service registration). The TUI
-  poll and the Telegram cards are two answer channels for one poll — the first
-  answer wins on either side, and `form.replied` / `form.cancelled` events
-  keep the cards honest when the TUI answers first or the run is interrupted.
-  If the service registration is unavailable (or a form is one the bridge
-  cannot honestly answer — other plugins' forms, unsupported field kinds), the
-  cards degrade to a notice pointing at the TUI, and when even the built-in
-  tool cannot create a form the bridge falls back to replacing its `execute`
-  with a Telegram-only flow.
+  same buttons) for **every session in the project** — ask from any TUI
+  session and the cards still land in your chat — and a tap or typed answer
+  settles the form over HTTP (`session.form.reply` via the server's own
+  service registration). The TUI poll and the Telegram cards are two answer
+  channels for one poll — the first answer wins on either side, and
+  `form.replied` / `form.cancelled` events keep the cards honest when the TUI
+  answers first or the run is interrupted. If the service registration is
+  unavailable (or a form is one the bridge cannot honestly answer — other
+  plugins' forms, unsupported field kinds), the cards degrade to a notice
+  pointing at the TUI for the bound session, and when even the built-in tool
+  cannot create a form the bridge falls back to replacing its `execute` with
+  a Telegram-only flow.
 - **Streaming** — `session.text.started/delta/ended` events drive one Telegram
   message that is edited in place (throttled by `streamIntervalMs`), falling back
   to a fresh message per chunk when streaming is off or the message grew too large.
