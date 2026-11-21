@@ -8,6 +8,7 @@ node_modules/
 
 # Build / typecheck artifacts
 *.tsbuildinfo
+test-dist/
 
 # Editors / OS
 .DS_Store

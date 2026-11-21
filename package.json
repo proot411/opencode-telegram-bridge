@@ -9,7 +9,9 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:test": "tsc -p tsconfig.json --noEmit false --outDir test-dist || true",
+    "test:harness": "npm run build:test && node test/harness.mjs"
   },
   "dependencies": {
     "@opencode/client": "2.0.32"

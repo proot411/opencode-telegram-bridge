@@ -253,6 +253,46 @@ function isFormSettledError(error: unknown): boolean {
   return text.includes("Form.AlreadySettledError") || /already settled/i.test(text)
 }
 
+// ---------------------------------------------------------- provider alerts
+
+export interface ProviderAlert {
+  icon: string
+  label: string
+}
+
+/**
+ * Classify a provider error (from `session.retry.scheduled` /
+ * `session.step.failed`) into a short, scannable category. The event carries
+ * `{ type, message, status?, retryAfterMs? }` — status when the provider
+ * answered, message words when it didn't (network failures).
+ */
+export function classifyProviderError(error: {
+  type?: unknown
+  message?: unknown
+  status?: unknown
+}): ProviderAlert {
+  const message = typeof error.message === "string" ? error.message.toLowerCase() : ""
+  const status = typeof error.status === "number" ? error.status : undefined
+  if (status === 429 || /rate limit|too many requests/i.test(message)) return { icon: "🚦", label: "Rate limited" }
+  if (status === 402 || /quota|daily limit|credit|billing|exceeded|usage limit/i.test(message))
+    return { icon: "💳", label: "Quota / limit reached" }
+  if (status === 401 || status === 403 || /unauthorized|forbidden|invalid.{0,12}key|api key/i.test(message))
+    return { icon: "🔑", label: "Auth error" }
+  if (
+    (status !== undefined && status >= 500) ||
+    /failed to (fetch|reach)|econn|enotfound|etimedout|timed? ?out|network|socket|dns|overloaded/i.test(message)
+  )
+    return { icon: "📡", label: "Provider unreachable" }
+  if (status !== undefined && status >= 400) return { icon: "⚠️", label: `Provider error ${status}` }
+  return { icon: "⚠️", label: "Provider error" }
+}
+
+/** Trim a provider error message for a Telegram line. */
+function shortError(error: { message?: unknown }): string {
+  const message = typeof error.message === "string" ? error.message.trim() : ""
+  return fitMessage(message.replace(/\s+/g, " "), 160)
+}
+
 function isFormNotFoundError(error: unknown): boolean {
   const text = describeError(error)
   return text.includes("Form.NotFoundError") || /form not found/i.test(text)
@@ -583,6 +623,8 @@ export class Bridge {
   private readonly formWaits = new Map<string, QuestionWait>()
   /** HTTP connection back into this server; undefined ⇒ Telegram-only fallback. */
   private readonly formClient?: FormClient
+  /** Last provider-alert time per `${sessionID}:${label}` — dedupes retry spam. */
+  private readonly providerAlertsAt = new Map<string, number>()
   private readonly streams = new Map<string, StreamState>()
   private readonly callNames = new Map<string, string>()
   /** Last `/models` result, so `/model <n>` maps to what was on screen. */
@@ -604,6 +646,23 @@ export class Bridge {
   /** Stable label for hub diagnostics (KV post-mortems). */
   debugID(): string {
     return `${this.ctx.location.directory ?? "?"}#${this.sessionID ?? "unbound"}`
+  }
+
+  /**
+   * Provider retries repeat (OpenCode backs off and tries again, up to ten
+   * times) — the first alert goes out, repeats of the same category are
+   * silenced for a few minutes so a hard outage doesn't spam the chat.
+   */
+  private shouldSendProviderAlert(sessionID: unknown, label: string): boolean {
+    const key = `${typeof sessionID === "string" ? sessionID : "?"}:${label}`
+    const now = Date.now()
+    for (const [existing, at] of this.providerAlertsAt) {
+      if (now - at > 10 * 60_000) this.providerAlertsAt.delete(existing)
+    }
+    const last = this.providerAlertsAt.get(key)
+    if (last !== undefined && now - last < 3 * 60_000) return false
+    this.providerAlertsAt.set(key, now)
+    return true
   }
 
   /** Durable lifecycle breadcrumb for hub post-mortems (per location, append log). */
@@ -985,6 +1044,40 @@ export class Bridge {
       case "session.execution.failed": {
         if (!(await this.tracked(data.sessionID))) return
         await this.notify(`⚠️ The session failed: ${describeFailure(data.error)}`)
+        return
+      }
+      case "session.retry.scheduled": {
+        // Transient provider failures (rate limits, unreachable endpoints,
+        // quota) are retried silently by OpenCode — the user just sees the
+        // spinner spin. Surface them.
+        if (!this.options.providerAlerts) return
+        if (!(await this.tracked(data.sessionID))) return
+        const error = (data.error ?? {}) as { type?: unknown; message?: unknown; status?: unknown }
+        const alert = classifyProviderError(error)
+        if (!this.shouldSendProviderAlert(data.sessionID, alert.label)) return
+        const attempt = typeof data.attempt === "number" ? ` (attempt ${data.attempt})` : ""
+        const waitMs = typeof data.error?.retryAfterMs === "number" ? data.error.retryAfterMs : undefined
+        const when = waitMs !== undefined ? ` — retrying in ${Math.max(1, Math.ceil(waitMs / 1000))}s` : " — retrying"
+        const detail = shortError(error)
+        await this.notify(
+          `${alert.icon} ${alert.label}${attempt}${when}\n${detail}`.trim(),
+        )
+        return
+      }
+      case "session.step.failed": {
+        if (!this.options.providerAlerts) return
+        if (!(await this.tracked(data.sessionID))) return
+        const error = (data.error ?? {}) as { type?: unknown; message?: unknown; status?: unknown }
+        const alert = classifyProviderError(error)
+        if (!this.shouldSendProviderAlert(data.sessionID, `step:${alert.label}`)) return
+        const finish = typeof data.finish === "string" && data.finish !== "" ? ` (finish: ${data.finish})` : ""
+        await this.notify(`${alert.icon} Step failed — ${alert.label}${finish}\n${shortError(error)}`.trim())
+        return
+      }
+      case "session.compaction.failed": {
+        if (!this.options.providerAlerts) return
+        if (!(await this.tracked(data.sessionID))) return
+        await this.notify(`⚠️ Compaction failed: ${describeFailure(data.error)}`)
         return
       }
       case "session.execution.interrupted": {

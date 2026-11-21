@@ -37,6 +37,8 @@ export interface BridgeOptions {
   readonly streamIntervalMs: number
   /** Notify about tool calls and their outcomes. */
   readonly toolNotifications: boolean
+  /** Alert on provider errors: rate limits, quota/daily limits, unreachable endpoints, failed steps. */
+  readonly providerAlerts: boolean
   /** Show a transient "typing…" indicator while the agent works. */
   readonly typing: boolean
   /** Forward output of every session in this location, not just the bridged one. */
@@ -68,6 +70,7 @@ const DEFAULTS = {
   stream: true,
   streamIntervalMs: 1500,
   toolNotifications: false,
+  providerAlerts: true,
   typing: true,
   forwardAllSessions: false,
   allSessionPermissions: false,
@@ -127,6 +130,7 @@ export function readOptions(raw: Readonly<Record<string, any>>): BridgeOptions {
     stream: flag(raw.stream, DEFAULTS.stream),
     streamIntervalMs: number(raw.streamIntervalMs, DEFAULTS.streamIntervalMs, 250, 30_000),
     toolNotifications: flag(raw.toolNotifications, DEFAULTS.toolNotifications),
+    providerAlerts: flag(raw.providerAlerts, DEFAULTS.providerAlerts),
     typing: flag(raw.typing, DEFAULTS.typing),
     forwardAllSessions: flag(raw.forwardAllSessions, DEFAULTS.forwardAllSessions),
     allSessionPermissions: flag(raw.allSessionPermissions, DEFAULTS.allSessionPermissions),

@@ -11,6 +11,7 @@ chat — from your phone, while you're away from the keyboard.
 - **Permission cards** — pending permissions arrive as a card with inline buttons: *Allow once* / *Allow always* / *Reject*.
 - **Questions as buttons, in both UIs** — the agent's `question` prompts appear as an interactive poll in the OpenCode TUI **and** as tappable cards in Telegram at the same time. Both answer the same poll; first answer wins.
 - **Live streaming** — the agent's answer streams into one Telegram message that edits itself in place.
+- **Provider alerts** — rate limits, quota/daily limits, unreachable endpoints, auth errors, and failed steps are retried silently by OpenCode; the bridge tells you what's happening instead of leaving a spinner.
 - **Full session control** — create, list, switch, rename, compact, and delete sessions; switch models and agents without touching the terminal.
 - **Images in both directions** — send a photo and the agent sees it; ask the agent for a screenshot and it pushes one back through the `send_telegram_image` tool.
 - **Keep-alive** — survives OpenCode's hardcoded 60-minute idle eviction so the bridge never silently dies on you.
@@ -158,6 +159,7 @@ All options live under the plugin's `options` object in `opencode.json(c)`.
 | `streamIntervalMs` | `1500` | Minimum gap between streaming edits (250–30000) |
 | `typing` | `true` | Show a "typing…" indicator while the agent works |
 | `toolNotifications` | `false` | Notify on every tool call (🔧 / ✅ / ❌) |
+| `providerAlerts` | `true` | Alert when the provider hits rate limits, quota/daily limits, auth errors, or is unreachable; repeats of the same category are silenced for 3 minutes |
 | `forwardAllSessions` | `false` | Mirror **every** session in this location, not just the bridged one |
 | `allSessionPermissions` | `false` | Surface and manage permission requests from **every** session in this location; `/status`, `/allow`, `/deny` span them all |
 | `questionTimeoutMs` | `600000` | How long an agent question waits before the poll is cancelled with "No answer (timed out)" feedback (5000–3600000) |
@@ -191,6 +193,13 @@ Disable it only if something else in that location already keeps it busy.
   card; a tap calls `permission.reply({ decision })`. Pending requests that existed
   before the plugin started are replayed on startup. Replies from other clients
   close the card too (`permission.replied`).
+- **Provider alerts** — `session.retry.scheduled`, `session.step.failed`, and
+  `session.compaction.failed` events are classified by HTTP status / message
+  (rate limited, quota/daily limit, auth, unreachable, other) and mirrored to
+  the chat with the provider's own error text and the retry delay. The first
+  alert of each category goes out immediately; repeats within 3 minutes are
+  suppressed so a hard outage doesn't spam (the terminal
+  `session.execution.failed` always notifies).
 - **Questions** — the built-in `question` tool runs untouched: it creates an
   OpenCode Form, which is what the TUI renders as the interactive poll. The
   bridge mirrors that same form to Telegram (`form.created` → cards with the
